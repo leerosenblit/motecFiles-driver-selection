@@ -1,0 +1,16 @@
+# Driver Selection Dashboard — MoTeC telemetry analysis
+#
+#   pip install -r requirements.txt
+#   streamlit run app.py
+#
+# No MoTeC parsing library is listed: there is no maintained .ld reader on PyPI,
+# so motec_parser.py implements the binary format directly and needs nothing
+# beyond numpy. .ldx is XML and is read with the standard library.
+
+streamlit>=1.44
+pandas>=2.0
+numpy>=1.24
+plotly>=5.21          # 5.21 introduced hoversubplots, used by the overlay crosshair
+
+# Optional — only needed to run the test suite:
+# pytest>=8.0
