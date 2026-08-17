@@ -25,11 +25,34 @@ import sys
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit.runtime.scriptrunner import get_script_run_ctx
+
+
+def _running_under_streamlit() -> bool:
+    """Whether a Streamlit script-run context is active.
+
+    Deliberately defensive. The context lives on a semi-internal Streamlit path
+    that has moved between releases, and a hosted deployment installs whatever
+    version is current — so this check must never be the thing that takes the
+    app down. Any failure to determine the answer is treated as "yes, we are
+    running normally", because refusing to start is far worse than skipping a
+    convenience message.
+    """
+    for module, attr in (
+        ("streamlit.runtime.scriptrunner", "get_script_run_ctx"),
+        ("streamlit.runtime.scriptrunner_utils.script_run_context",
+         "get_script_run_ctx"),
+    ):
+        try:
+            mod = __import__(module, fromlist=[attr])
+            return getattr(mod, attr)() is not None
+        except Exception:
+            continue
+    return True
+
 
 # Run with `python app.py` and Streamlit's widgets return None, which fails
 # later with an unhelpful traceback. Say what to do instead.
-if get_script_run_ctx() is None:
+if not _running_under_streamlit():
     sys.exit(
         # Plain ASCII: this goes to a terminal, and Windows consoles default to
         # cp1252, which mangles an em dash.

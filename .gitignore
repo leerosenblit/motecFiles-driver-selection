@@ -1,0 +1,22 @@
+# Compiled bytecode must never be committed. Beyond the noise, a stale .pyc for
+# the same interpreter version as the host can shadow a source file that has
+# since changed, which produces "cannot import name X" errors that are very hard
+# to trace on a hosted deploy.
+__pycache__/
+*.py[cod]
+*$py.class
+
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Generated sample logs. Regenerate with:  python sample_data.py [n]
+# Comment this out if you want them in the repo for testing uploads on a
+# hosted deploy, but note they add ~1.3 MB per driver to every clone.
+samples/
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

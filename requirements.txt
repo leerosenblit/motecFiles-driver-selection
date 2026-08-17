@@ -1,4 +1,4 @@
-# Driver Selection Dashboard — MoTeC telemetry analysis
+# Driver Selection Dashboard - MoTeC telemetry analysis
 #
 #   pip install -r requirements.txt
 #   streamlit run app.py
@@ -6,11 +6,20 @@
 # No MoTeC parsing library is listed: there is no maintained .ld reader on PyPI,
 # so motec_parser.py implements the binary format directly and needs nothing
 # beyond numpy. .ldx is XML and is read with the standard library.
+#
+# Upper bounds are deliberate. A hosted deploy resolves unbounded specifiers to
+# the newest release, so ">=" alone means the app runs on a combination that was
+# never tested - and pandas 3 changes copy-on-write and .iloc assignment
+# semantics that this code relies on. Verified against Python 3.11.9 with
+# streamlit 1.58.0, pandas 2.2.1, numpy 1.26.4, plotly 6.9.0.
+#
+# ASCII only on purpose: pip reads this file with the locale encoding on some
+# platforms, and a stray non-ASCII character there is an obscure install failure.
 
-streamlit>=1.44
-pandas>=2.0
-numpy>=1.24
-plotly>=5.21          # 5.21 introduced hoversubplots, used by the overlay crosshair
+streamlit>=1.50,<2      # 1.50+ for width="stretch" on charts and dataframes
+pandas>=2.1,<3
+numpy>=1.26,<3
+plotly>=5.21,<7         # 5.21 added hoversubplots, used by the overlay crosshair
 
-# Optional — only needed to run the test suite:
+# Optional - only needed to run the test suite:
 # pytest>=8.0
