@@ -23,20 +23,30 @@ from motec_parser import CHANNEL_LABELS
 # this pace, so "fast" alone is not the goal — hitting 210 s is.
 TARGET_LAP_TIME_S = 210.0
 
-# Energy budget per lap, in watt-hours, matching the team's "Base (210s)"
-# strategy in Pit_Dashboard/constants.py. Their strategy table trades pace
-# against energy — 189 s costs 88 Wh, 231 s costs 72 Wh — so a driver's
-# (lap time, energy) pair only makes sense read against the target pair.
-ENERGY_BUDGET_WH_PER_LAP = 80.0
+# Energy budget for a lap at the target pace, in watt-hours.
+#
+# Note this is 100 Wh, while Pit_Dashboard/constants.py still lists the
+# "Base (210s)" strategy at 80 Wh — the two want reconciling, and the number
+# here is the one the team currently races to. It is a sidebar input, so it can
+# be changed per session without editing code.
+ENERGY_BUDGET_WH_PER_LAP = 100.0
 
-# The team's documented pace/energy trade-off, used as reference context when
-# reading a driver's numbers. Keep in sync with Pit_Dashboard/constants.py.
+# The team's pace/energy trade-off from Pit_Dashboard/constants.py, kept as
+# RELATIVE factors against the base strategy rather than absolute watt-hours.
+#
+# Storing ratios is what lets the budget above be changed freely: the expected
+# cost of a lap is always `budget x factor(lap_time)`, so the whole curve moves
+# with the budget and can never contradict it. Hard-coding the absolute table
+# would leave the pace correction anchored to a stale 80 Wh while the dashboard
+# reported against 100 Wh.
+#
+# (label, lap time [s], energy relative to the base lap)
 STRATEGY_REFERENCE = [
-    ("Fast (-10%)", 189.0, 88.0),
-    ("Med-Fast (-5%)", 199.5, 84.0),
-    ("Base (210s)", 210.0, 80.0),
-    ("Med-Slow (+5%)", 220.5, 76.0),
-    ("Slow (+10%)", 231.0, 72.0),
+    ("Fast (-10%)", 189.0, 88.0 / 80.0),
+    ("Med-Fast (-5%)", 199.5, 84.0 / 80.0),
+    ("Base (210s)", 210.0, 1.0),
+    ("Med-Slow (+5%)", 220.5, 76.0 / 80.0),
+    ("Slow (+10%)", 231.0, 72.0 / 80.0),
 ]
 
 # Reference throttle-derivative variance used to put the smoothness score on a
@@ -236,24 +246,24 @@ def smoothness_from_rate(rate: np.ndarray) -> tuple[float, float, float]:
 # Energy
 # --------------------------------------------------------------------------
 
-def expected_energy_wh(lap_time_s: float) -> float:
-    """Energy a lap at this pace *should* cost, per the team's strategy table.
+def expected_energy_wh(lap_time_s: float,
+                       budget_wh: float = ENERGY_BUDGET_WH_PER_LAP) -> float:
+    """Energy a lap at this pace *should* cost, given the budget at target pace.
 
     Needed because raw Wh/lap is not a fair way to compare drivers: going slower
     always uses less energy, so ranking on it alone would crown whoever was
-    least committed. Interpolating the team's own pace/energy curve gives the
+    least committed. Scaling the team's pace/energy curve by the budget gives the
     expected cost at the pace actually driven, and the difference between actual
-    and expected is the part attributable to the driver rather than to their
-    speed.
+    and expected is the part attributable to the driver rather than their speed.
 
     Outside the tabulated 189-231 s range the endpoints are held flat, which is
     the conservative reading — we don't invent a slope we have no data for.
     """
     if not np.isfinite(lap_time_s):
         return float("nan")
-    times = [t for _label, t, _wh in STRATEGY_REFERENCE]
-    energies = [wh for _label, _t, wh in STRATEGY_REFERENCE]
-    return float(np.interp(lap_time_s, times, energies))
+    times = [t for _label, t, _factor in STRATEGY_REFERENCE]
+    factors = [f for _label, _t, f in STRATEGY_REFERENCE]
+    return float(budget_wh * np.interp(lap_time_s, times, factors))
 
 
 def energy_per_lap(df: pd.DataFrame,
@@ -431,7 +441,7 @@ def compute_driver_metrics(name: str, df: pd.DataFrame, laps: pd.DataFrame,
             # should have cost. Positive = energy wasted by how they drove.
             if np.isfinite(m.median_lap_s):
                 m.energy_excess_wh = (m.median_energy_wh
-                                      - expected_energy_wh(m.median_lap_s))
+                                      - expected_energy_wh(m.median_lap_s, budget_wh))
 
             # Wh/km normalises away any difference in lap length, so a lap cut
             # short by a pit entry cannot look artificially efficient.

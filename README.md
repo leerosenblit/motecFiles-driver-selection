@@ -28,10 +28,10 @@ python sample_data.py 10     # -> a full ten-driver field
 | [plots.py](plots.py) | Plotly figures and the shared colour/chrome system |
 | [sample_data.py](sample_data.py) | Synthetic stints + a `.ld`/`.ldx` writer |
 | [test_analysis.py](test_analysis.py) | Parser and pace metrics — 34 tests |
-| [test_energy.py](test_energy.py) | Energy, Driver Score, palette — 30 tests |
+| [test_energy.py](test_energy.py) | Energy, Driver Score, real-log naming, palette — 36 tests |
 
 ```bash
-python -m pytest test_analysis.py test_energy.py -q     # 64 tests
+python -m pytest test_analysis.py test_energy.py -q     # 70 tests
 ```
 
 Pipeline per log:
@@ -53,6 +53,8 @@ compute_driver_metrics                -> the five metrics
 | **Consistency** | Sample standard deviation (ddof=1) of the valid lap times |
 | **Smoothness** | Variance of d(Throttle)/dt in (%/s)², plus a 0–100 presentation score |
 | **Energy** | Wh per lap, Wh/km, and **energy excess** — Wh above what that driver's own pace should cost |
+
+Energy budget defaults to **100 Wh/lap** at the 210 s target. Note `Pit_Dashboard/constants.py` still lists the `base_210s` strategy at 80 Wh — the two want reconciling. It is a sidebar input either way.
 
 **Why the throttle derivative.** A driver holding 60% throttle and one
 oscillating 40–80% can share the same mean and the same distribution of throttle
@@ -83,8 +85,8 @@ from whichever source the log offers, most trustworthy first:
 1. a cumulative counter (`total_race_energy`) differenced per lap — the car's own
    coulomb-counted accounting, already net of regen;
 2. **trapezoidal integration of power** over the lap, `E[Wh] = Σ (P₁+P₂)/2·Δt / 3600`,
-   where power is `mms_power_W` or derived as `V × I` from `bms_voltage_V` and
-   `bms_current_A`;
+   where power is `Drivetrain Power` (hp/PS are converted to watts), `mms_power_W`,
+   or derived as `V × I` from `bms_voltage_V` and `bms_current_A`;
 3. a per-lap channel (`last_lap_energy`), read one lap behind, since a "last lap"
    figure holds lap *N−1* while lap *N* is being driven.
 
@@ -93,12 +95,34 @@ logged at different rates and multiplying them on separate time bases would pair
 samples taken at different moments. If the pack current logs discharge as
 negative, the sign is detected from the median and flipped, with a warning.
 
+**Subsystem counters are deliberately excluded.** `KERS Deployed Energy` counts
+only the hybrid boost released from the store, not what went through the
+drivetrain, so treating it as the energy counter would outrank power integration
+and under-report consumption by an order of magnitude. Integrating power is the
+honest measure. If the energy section comes up empty, the app now lists every
+channel in your log that looks energy-related, so a missing alias is obvious.
+
+**Two shapes of distance channel** are handled, because they need opposite
+arithmetic. A cumulative odometer only ever climbs; a `Lap Distance` channel runs
+0 → track length and resets at the line. Lap distance is therefore the sum of the
+channel's *positive* increments, and the overlay x-axis is their running total —
+taking end-minus-start would read a full lap of a resetting channel as roughly
+**zero**, and subtracting the lap's first value would send the overlay axis
+sharply negative at the reset. Verified against real logs: 3960 m/lap, agreeing
+with an independent speed-integral to 0.4%.
+
 **Energy excess is the metric that matters for driver selection.** Raw Wh/lap
 would crown whoever drove slowest — going slower always uses less energy. So
 consumption is compared against what a lap at that driver's *own* median pace
-should cost, interpolated from the team's strategy table in
-`Pit_Dashboard/constants.py` (189 s → 88 Wh … 231 s → 72 Wh). The difference is
-the part attributable to the driver rather than to their speed.
+should cost. The difference is the part attributable to the driver rather than to
+their speed.
+
+The expectation curve comes from the team's strategy table in
+`Pit_Dashboard/constants.py`, held as **relative factors** rather than absolute
+watt-hours (189 s costs 1.10× a base lap, 231 s costs 0.90×). Expected cost is
+then `budget × factor(lap_time)`, so the whole curve follows the budget you set
+and can never contradict it — hard-coding the absolute table would leave the pace
+correction pinned to 80 Wh while the dashboard reported against 100.
 
 **Smoothness is only a proxy for this, and the two can disagree outright.** The
 car is a low-pass filter with a time constant of order *m/(ρ·CdA·v)* ≈ 90 s, so a

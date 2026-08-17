@@ -504,7 +504,7 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
         help=(f"Median over the valid laps. Budget {budget_wh:.0f} Wh "
               f"({format_delta(m.energy_delta_wh).replace(' s', ' Wh')}). "
               f"A lap at this driver's own pace should cost "
-              f"{expected_energy_wh(m.median_lap_s):.1f} Wh, so "
+              f"{expected_energy_wh(m.median_lap_s, budget_wh):.1f} Wh, so "
               f"{m.energy_excess_wh:+.1f} Wh is down to how they drove. "
               f"Efficiency {m.wh_per_km:.1f} Wh/km. Source: {m.energy_source}.")
         if np.isfinite(m.median_energy_wh)
@@ -661,12 +661,45 @@ st.subheader("Energy consumption")
 if not any_energy:
     st.info(
         "**No energy data in these logs.** To measure consumption the log needs "
-        "one of: a power channel (`mms_power_W`, `Power`), pack **voltage and "
-        "current** (`bms_voltage_V` + `bms_current_A`) from which power is "
-        "derived, or a cumulative energy counter (`total_race_energy`). Without "
-        "any of them, throttle smoothness is the only efficiency signal — and it "
-        "is a proxy, not a measurement."
+        "one of: a power channel (`Drivetrain Power`, `mms_power_W`, `Power`), "
+        "pack **voltage and current** (`bms_voltage_V` + `bms_current_A`) from "
+        "which power is derived, or a cumulative energy counter "
+        "(`total_race_energy`). Without any of them, throttle smoothness is the "
+        "only efficiency signal — and it is a proxy, not a measurement."
     )
+
+    # Channel names vary a lot between logger configurations, so rather than
+    # leaving the reader to guess, list what each log actually contains that
+    # looks energy-related. If the right channel is sitting here under a name the
+    # alias list does not know, this is where you spot it.
+    import re as _re
+
+    candidate = _re.compile(
+        r"volt|amp|curr|power|energ|batt|soc|charge|kers|ers|watt|joule|"
+        r"consum|fuel|torque|hp\b",
+        _re.I,
+    )
+    for i, s in enumerate(stints):
+        hits = [c for c in s["all_channels"]
+                if candidate.search(c[0]) or candidate.search(str(c[1]))]
+        driver_heading(s["driver"], i,
+                       f"{len(hits)} of {len(s['all_channels'])} channels look "
+                       "energy-related")
+        if hits:
+            st.dataframe(
+                pd.DataFrame(hits, columns=["Channel", "Unit", "Rate [Hz]", "Samples"]),
+                hide_index=True, width="stretch",
+            )
+            st.caption(
+                "If one of these is the car's power or energy channel, it only "
+                "needs adding to `CHANNEL_ALIASES` in motec_parser.py."
+            )
+        else:
+            st.caption(
+                "Nothing energy-related in this log at all — the logger was not "
+                "recording the battery. That is a MoTeC channel-configuration "
+                "change, not something the dashboard can recover."
+            )
 else:
     energy_stints = [
         {"name": s["driver"], "laps": s["laps"], "keep": keep_masks[i],
@@ -706,7 +739,8 @@ else:
                 "Driver": m.name,
                 "Median lap": format_lap_time(m.median_lap_s),
                 "Actual [Wh/lap]": round(m.median_energy_wh, 1),
-                "Expected at that pace [Wh]": round(expected_energy_wh(m.median_lap_s), 1),
+                "Expected at that pace [Wh]": round(
+                    expected_energy_wh(m.median_lap_s, budget_wh), 1),
                 "Excess [Wh/lap]": round(m.energy_excess_wh, 1),
                 "Efficiency [Wh/km]": round(m.wh_per_km, 1),
                 "Stint total [Wh]": round(m.total_energy_wh, 0),

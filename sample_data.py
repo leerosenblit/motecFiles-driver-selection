@@ -32,9 +32,9 @@ TARGET_LAP_S = 210.0
 # a smooth lap at the 210 s target lands near the team's 80 Wh/lap budget.
 MASS_KG = 300.0             # car + driver
 # Crr and CdA are calibrated so a lap held at a steady 210 s pace lands on the
-# team's 80 Wh/lap budget from Pit_Dashboard/constants.py.
-CRR = 0.0068                # rolling resistance coefficient
-CDA = 0.112                 # drag area [m^2]
+# team's 100 Wh/lap energy budget (metrics.ENERGY_BUDGET_WH_PER_LAP).
+CRR = 0.00965               # rolling resistance coefficient
+CDA = 0.160                 # drag area [m^2]
 RHO_AIR = 1.2               # [kg/m^3]
 DRIVETRAIN_EFF = 0.90       # battery -> wheels
 REGEN_EFF = 0.55            # wheels -> battery (the asymmetry is the point)

@@ -391,6 +391,10 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
     "g_lat": [
         "g force lat", "g force lateral", "lateral g", "lat g",
         "g lat", "acceleration lateral", "accel lat",
+        # Sim exports and some MoTeC configs name it after the measurement point
+        # rather than the quantity.
+        "cg accel lateral", "accel lateral", "lateral acceleration",
+        "lat accel", "acc lat",
     ],
     "distance": [
         "distance", "corr distance", "corrected distance", "lap distance",
@@ -407,6 +411,9 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
     "power": [
         "mms power w", "power", "motor power", "battery power", "pack power",
         "elec power", "electrical power", "bus power", "motor elec power",
+        # Sim / combustion-derived logs report power at the drivetrain, often in
+        # horsepower. Negative values are recovery, same as a negative pack current.
+        "drivetrain power", "drive train power", "engine power", "output power",
     ],
     "voltage": [
         "bms voltage v", "battery voltage", "pack voltage", "bus voltage",
@@ -423,8 +430,19 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
     "lap_energy": ["last lap energy", "lap energy", "energy per lap"],
     "soc": [
         "bms soc percent", "state of charge", "battery soc", "soc",
-        "charge level",
+        "charge level", "kers charge", "battery charge", "ers charge",
     ],
+}
+
+# Channels that look like energy but measure only a SUBSYSTEM, so they must never
+# be mistaken for the car's total consumption. "KERS Deployed Energy" counts just
+# the hybrid boost released from the store, which in a real log is a small
+# fraction of what went through the drivetrain — aliasing it as the energy
+# counter would silently under-report consumption by an order of magnitude.
+# Integrating the power channel is the honest measure, so these are excluded.
+SUBSYSTEM_ENERGY_CHANNELS = {
+    "kersdeployedenergy", "kersenergy", "ersdeployedenergy", "ersenergy",
+    "kersharvestedenergy", "ersharvestedenergy", "kersrecoveredenergy",
 }
 
 # Expected units per canonical channel. Used to break ties between candidate
@@ -437,7 +455,7 @@ CHANNEL_UNIT_HINTS: dict[str, set[str]] = {
     "steering": {"deg", "degrees", "rad"},
     "g_lat": {"g", "ms2", "mss"},
     "distance": {"m", "km", "mi", "mile", "miles", "ft", "feet"},
-    "power": {"w", "kw", "watt", "watts"},
+    "power": {"w", "kw", "watt", "watts", "hp", "ps", "bhp", "cv"},
     "voltage": {"v", "volt", "volts", "mv"},
     "current": {"a", "amp", "amps", "ma"},
     "energy": {"wh", "kwh", "j", "kj", "mj"},
@@ -500,6 +518,12 @@ def identify_channels(log: LDLog) -> dict[str, Channel]:
         hint = CHANNEL_UNIT_HINTS.get(key)
         return hint is None or _squash(ch.unit) in hint
 
+    def allowed(key: str, ch: Channel) -> bool:
+        """Reject channels that measure a subsystem rather than the whole car."""
+        if key in ("energy", "lap_energy"):
+            return _squash(ch.name) not in SUBSYSTEM_ENERGY_CHANNELS
+        return True
+
     def claim(key: str, ch: Channel) -> bool:
         """Assign a channel to a key unless it is already used elsewhere."""
         if ch.name in {c.name for c in found.values()}:
@@ -512,7 +536,7 @@ def identify_channels(log: LDLog) -> dict[str, Channel]:
     for key, aliases in CHANNEL_ALIASES.items():
         for alias in aliases:
             a = _squash(alias)
-            hits = [ch for ch, s in squashed.items() if s == a]
+            hits = [ch for ch, s in squashed.items() if s == a and allowed(key, ch)]
             if not hits:
                 continue
             preferred = next((c for c in hits if unit_ok(key, c)), hits[0])
@@ -526,7 +550,8 @@ def identify_channels(log: LDLog) -> dict[str, Channel]:
         for alias in aliases:
             a = _squash(alias)
             hit = next((ch for ch, s in squashed.items()
-                        if s.startswith(a) and unit_ok(key, ch)), None)
+                        if s.startswith(a) and unit_ok(key, ch)
+                        and allowed(key, ch)), None)
             if hit is not None and claim(key, hit):
                 break
 
@@ -567,6 +592,10 @@ def _convert_units(key: str, ch: Channel) -> np.ndarray:
     elif key == "power":
         if unit in ("kw",):
             vals = vals * 1000.0
+        elif unit in ("hp", "bhp"):
+            vals = vals * 745.6999          # mechanical horsepower -> W
+        elif unit in ("ps", "cv"):
+            vals = vals * 735.49875         # metric horsepower -> W
     elif key == "voltage":
         if unit in ("mv",):
             vals = vals / 1000.0
@@ -709,6 +738,30 @@ def _derive_power(df: pd.DataFrame, found: dict[str, Channel],
 # Lap division — read, never inferred
 # --------------------------------------------------------------------------
 
+def _distance_travelled(segment: np.ndarray) -> float:
+    """Distance covered across a run of samples from a distance channel.
+
+    Works for both kinds of distance channel without needing to know which it is:
+
+      cumulative odometer   0, 12, 25, ... 56138        (never resets)
+      lap distance          3537, ... 6135, 1.8, ... 3536   (resets at the line)
+
+    Summing only the POSITIVE increments handles both. For an odometer every
+    increment is positive, so the result is simply end minus start. For a
+    resetting channel the single large negative jump at the line is skipped
+    rather than being counted as travelling backwards.
+
+    Taking end-minus-start instead — which is what this used to do — reads a
+    full lap of a resetting channel as roughly ZERO, because the value returns
+    to where it began.
+    """
+    seg = segment[np.isfinite(segment)]
+    if seg.size < 2:
+        return float("nan")
+    delta = np.diff(seg)
+    return float(delta[delta > 0].sum())
+
+
 def _segments_to_table(df: pd.DataFrame, bounds: list[int],
                        source: str,
                        lap_times: list[float] | None = None) -> pd.DataFrame:
@@ -736,8 +789,8 @@ def _segments_to_table(df: pd.DataFrame, bounds: list[int],
             "End [s]": float(t[hi]),
             "start_idx": int(lo),
             "end_idx": int(hi),
-            "Distance [m]": (float(dist[hi] - dist[lo])
-                             if dist is not None and np.isfinite(dist[hi]) else np.nan),
+            "Distance [m]": (_distance_travelled(dist[lo:hi + 1])
+                             if dist is not None else np.nan),
         })
 
     out = pd.DataFrame(rows)
@@ -898,22 +951,35 @@ def apply_ldx_laps(df: pd.DataFrame, marker_times_s: list[float]) -> pd.DataFram
 def add_lap_columns(df: pd.DataFrame, laps: pd.DataFrame) -> pd.DataFrame:
     """Annotate each row with its lap number and distance-into-lap.
 
-    `Lap Distance [m]` is what makes a head-to-head overlay meaningful: the raw
-    Distance channel is a cumulative odometer, so two drivers on the same lap
-    would otherwise sit kilometres apart on the x-axis.
+    `Lap Distance [m]` is what makes a head-to-head overlay meaningful: it must
+    run 0 -> lap length within every lap, so that x = 1200 m is the same corner
+    for both drivers.
+
+    It is built by accumulating the positive increments of the distance channel
+    rather than subtracting the lap's first value, because that has to work for
+    both channel types. Subtracting the first value is correct only for a
+    cumulative odometer; on a channel that resets at the start/finish line it
+    produces an axis that jumps sharply NEGATIVE at the reset and is no longer
+    monotonic, which silently ruins the overlay.
     """
     out = df.copy()
     out["_Lap"] = np.nan
     dist_col = CHANNEL_LABELS["distance"]
     if dist_col in out:
         out["Lap Distance [m]"] = np.nan
+        lap_dist_loc = out.columns.get_loc("Lap Distance [m]")
+    lap_loc = out.columns.get_loc("_Lap")
 
     for row in laps.itertuples(index=False):
         lo, hi = int(row.start_idx), int(row.end_idx)
-        out.iloc[lo:hi + 1, out.columns.get_loc("_Lap")] = row.Lap
+        out.iloc[lo:hi + 1, lap_loc] = row.Lap
         if dist_col in out:
-            seg = out[dist_col].to_numpy()[lo:hi + 1]
-            base = seg[0] if len(seg) and np.isfinite(seg[0]) else np.nan
-            out.iloc[lo:hi + 1, out.columns.get_loc("Lap Distance [m]")] = seg - base
+            seg = out[dist_col].to_numpy()[lo:hi + 1].astype(np.float64)
+            step = np.diff(seg, prepend=seg[0] if len(seg) else 0.0)
+            # Drop the reset jump (and any backwards jitter) so the axis only
+            # ever advances.
+            step[~np.isfinite(step)] = 0.0
+            step[step < 0] = 0.0
+            out.iloc[lo:hi + 1, lap_dist_loc] = np.cumsum(step)
 
     return out

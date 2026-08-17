@@ -216,12 +216,17 @@ def test_energy_stats_use_the_same_kept_laps_as_pace():
 # --------------------------------------------------------------------------
 
 def test_expected_energy_interpolates_and_clamps():
-    assert M.expected_energy_wh(210.0) == pytest.approx(80.0)
-    assert M.expected_energy_wh(189.0) == pytest.approx(88.0)
-    assert 80.0 < M.expected_energy_wh(204.75) < 84.0     # halfway 199.5 -> 210
+    # The curve is anchored to the budget at target pace, so a lap at target
+    # costs exactly the budget and the rest scale with it.
+    assert M.expected_energy_wh(210.0, 100.0) == pytest.approx(100.0)
+    assert M.expected_energy_wh(189.0, 100.0) == pytest.approx(110.0)
+    assert 100.0 < M.expected_energy_wh(204.75, 100.0) < 105.0
     # Outside the table the endpoints hold flat rather than extrapolating.
-    assert M.expected_energy_wh(120.0) == pytest.approx(88.0)
-    assert M.expected_energy_wh(400.0) == pytest.approx(72.0)
+    assert M.expected_energy_wh(120.0, 100.0) == pytest.approx(110.0)
+    assert M.expected_energy_wh(400.0, 100.0) == pytest.approx(90.0)
+    # Changing the budget rescales the whole curve, never contradicts it.
+    assert M.expected_energy_wh(210.0, 80.0) == pytest.approx(80.0)
+    assert M.expected_energy_wh(189.0, 80.0) == pytest.approx(88.0)
 
 
 def test_slower_laps_are_expected_to_use_less_energy():
@@ -471,3 +476,124 @@ def test_energy_chart_handles_missing_energy_gracefully(stint):
         [{"name": "a", "laps": laps, "keep": None,
           "energy": np.full(len(laps), np.nan), "slot": 0}], mode="light")
     assert any("No energy data" in (a.text or "") for a in fig.layout.annotations)
+
+
+# --------------------------------------------------------------------------
+# Real-log channel naming (found against actual MoTeC exports)
+# --------------------------------------------------------------------------
+
+def test_sim_and_drivetrain_channel_names_are_recognised():
+    """Names taken from real MoTeC exports the team actually uses.
+
+    These logs carry no bms_*/mms_* channels at all: power arrives as
+    "Drivetrain Power" in horsepower, lateral G as "CG Accel Lateral", and state
+    of charge as "KERS Charge". Before these aliases the energy section was
+    simply empty.
+    """
+    log = P.LDLog(channels=[
+        P.Channel("Ground Speed", "spd", "kph", 30, np.full(10, 90.0)),
+        P.Channel("CG Accel Lateral", "gl", "G", 50, np.zeros(10)),
+        P.Channel("Drivetrain Power", "pwr", "hp", 10, np.full(10, 20.0)),
+        P.Channel("KERS Charge", "soc", "%", 10, np.full(10, 80.0)),
+    ])
+    found = P.identify_channels(log)
+    assert found["g_lat"].name == "CG Accel Lateral"
+    assert found["power"].name == "Drivetrain Power"
+    assert found["soc"].name == "KERS Charge"
+
+
+def test_horsepower_converted_to_watts():
+    hp = P.Channel("Drivetrain Power", "p", "hp", 10, np.array([1.0]))
+    assert P._convert_units("power", hp)[0] == pytest.approx(745.7, rel=1e-3)
+    ps = P.Channel("Drivetrain Power", "p", "PS", 10, np.array([1.0]))
+    assert P._convert_units("power", ps)[0] == pytest.approx(735.5, rel=1e-3)
+
+
+def test_kers_deployed_energy_is_not_treated_as_total_consumption():
+    """A subsystem counter must not masquerade as the car's energy total.
+
+    "KERS Deployed Energy" counts only the hybrid boost released from the store.
+    Taking it as the energy counter would outrank integrating the power channel
+    and under-report consumption by an order of magnitude.
+    """
+    log = P.LDLog(channels=[
+        P.Channel("Lap Number", "lap", "", 10, np.repeat([1.0, 2.0], 100)),
+        P.Channel("KERS Deployed Energy", "ke", "kJ", 10,
+                  np.linspace(0.0, 1790.0, 200)),
+        P.Channel("Drivetrain Power", "pwr", "hp", 10, np.full(200, 20.0)),
+    ])
+    found = P.identify_channels(log)
+    assert "energy" not in found            # excluded as a subsystem channel
+    assert found["power"].name == "Drivetrain Power"
+
+    df, _ = P.to_dataframe(log)
+    laps = P.build_lap_table(df)
+    _wh, source = M.energy_per_lap(df, laps)
+    assert "integrated" in source           # power, not the KERS counter
+
+
+# --------------------------------------------------------------------------
+# Distance channels that reset each lap
+# --------------------------------------------------------------------------
+
+def _resetting_distance_log(track_m=3960.0, start_offset_m=3537.0, n_laps=3):
+    """A log whose distance channel resets at the line, starting mid-lap.
+
+    This is what the real exports look like: "Lap Distance" runs 0 -> track
+    length and wraps, and the recording begins partway around.
+    """
+    per_lap, freq = 200, 10.0
+    n = per_lap * n_laps
+    frac = (np.arange(n) / per_lap)                      # laps completed
+    dist = ((start_offset_m + frac * track_m) % track_m)
+    lap = np.floor((start_offset_m + frac * track_m) / track_m) + 1.0
+    return pd.DataFrame({
+        "Time [s]": np.arange(n) / freq,
+        "Distance [m]": dist,
+        "Lap Number": lap,
+        "Corr Speed [km/h]": np.full(n, track_m / (per_lap / freq) * 3.6),
+    })
+
+
+def test_resetting_distance_channel_gives_real_lap_length():
+    """End-minus-start reads a full lap of a resetting channel as ~zero."""
+    track = 3960.0
+    df = _resetting_distance_log(track_m=track)
+    laps = P.build_lap_table(df)
+
+    # Ignore the partial first and last laps; the middle ones are complete.
+    complete = laps["Distance [m]"].to_numpy()[1:-1]
+    assert len(complete) >= 1
+    assert np.allclose(complete, track, rtol=0.02), complete
+    # The naive calculation would have produced roughly nothing.
+    assert complete.min() > track * 0.9
+
+
+def test_overlay_axis_is_monotonic_across_a_distance_reset():
+    """A reset must not send the overlay x-axis sharply negative."""
+    df = _resetting_distance_log()
+    laps = P.build_lap_table(df)
+    annotated = P.add_lap_columns(df, laps)
+
+    for lap in laps["Lap"]:
+        seg = annotated.loc[annotated["_Lap"] == lap, "Lap Distance [m]"].to_numpy()
+        assert seg[0] == pytest.approx(0.0)
+        assert np.all(np.diff(seg) >= 0), f"lap {lap} axis goes backwards"
+        assert seg.min() >= 0.0
+
+
+def test_cumulative_odometer_still_works():
+    """The same code path must keep handling a non-resetting odometer."""
+    n, freq, track = 600, 10.0, 3960.0
+    df = pd.DataFrame({
+        "Time [s]": np.arange(n) / freq,
+        "Distance [m]": np.linspace(0.0, track * 3, n),      # never resets
+        "Lap Number": np.repeat([1.0, 2.0, 3.0], n // 3),
+    })
+    laps = P.build_lap_table(df)
+    assert np.allclose(laps["Distance [m]"].to_numpy(), track, rtol=0.02)
+
+    annotated = P.add_lap_columns(df, laps)
+    seg = annotated.loc[annotated["_Lap"] == 2, "Lap Distance [m]"].to_numpy()
+    assert seg[0] == pytest.approx(0.0)
+    assert np.all(np.diff(seg) >= 0)
