@@ -23,6 +23,22 @@ from motec_parser import CHANNEL_LABELS
 # this pace, so "fast" alone is not the goal — hitting 210 s is.
 TARGET_LAP_TIME_S = 210.0
 
+# Energy budget per lap, in watt-hours, matching the team's "Base (210s)"
+# strategy in Pit_Dashboard/constants.py. Their strategy table trades pace
+# against energy — 189 s costs 88 Wh, 231 s costs 72 Wh — so a driver's
+# (lap time, energy) pair only makes sense read against the target pair.
+ENERGY_BUDGET_WH_PER_LAP = 80.0
+
+# The team's documented pace/energy trade-off, used as reference context when
+# reading a driver's numbers. Keep in sync with Pit_Dashboard/constants.py.
+STRATEGY_REFERENCE = [
+    ("Fast (-10%)", 189.0, 88.0),
+    ("Med-Fast (-5%)", 199.5, 84.0),
+    ("Base (210s)", 210.0, 80.0),
+    ("Med-Slow (+5%)", 220.5, 76.0),
+    ("Slow (+10%)", 231.0, 72.0),
+]
+
 # Reference throttle-derivative variance used to put the smoothness score on a
 # 0-100 scale. A driver whose throttle rate-of-change has this variance scores
 # 50; smoother scores higher. It is a presentation constant only — every
@@ -45,6 +61,13 @@ class DriverMetrics:
     smoothness_var: float = float("nan")       # var of dThrottle/dt, (%/s)^2
     smoothness_rms: float = float("nan")       # sqrt of the above, %/s
     smoothness_score: float = float("nan")     # 0-100, higher = smoother
+    # Energy — the binding constraint on a solar car.
+    median_energy_wh: float = float("nan")     # Wh per lap
+    energy_delta_wh: float = float("nan")      # median Wh/lap - budget
+    wh_per_km: float = float("nan")            # energy per distance
+    total_energy_wh: float = float("nan")      # across the whole stint
+    energy_excess_wh: float = float("nan")     # Wh/lap above the pace-matched expectation
+    energy_source: str | None = None           # how energy was obtained
     excluded_laps: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -210,6 +233,116 @@ def smoothness_from_rate(rate: np.ndarray) -> tuple[float, float, float]:
 
 
 # --------------------------------------------------------------------------
+# Energy
+# --------------------------------------------------------------------------
+
+def expected_energy_wh(lap_time_s: float) -> float:
+    """Energy a lap at this pace *should* cost, per the team's strategy table.
+
+    Needed because raw Wh/lap is not a fair way to compare drivers: going slower
+    always uses less energy, so ranking on it alone would crown whoever was
+    least committed. Interpolating the team's own pace/energy curve gives the
+    expected cost at the pace actually driven, and the difference between actual
+    and expected is the part attributable to the driver rather than to their
+    speed.
+
+    Outside the tabulated 189-231 s range the endpoints are held flat, which is
+    the conservative reading — we don't invent a slope we have no data for.
+    """
+    if not np.isfinite(lap_time_s):
+        return float("nan")
+    times = [t for _label, t, _wh in STRATEGY_REFERENCE]
+    energies = [wh for _label, _t, wh in STRATEGY_REFERENCE]
+    return float(np.interp(lap_time_s, times, energies))
+
+
+def energy_per_lap(df: pd.DataFrame,
+                   laps: pd.DataFrame) -> tuple[np.ndarray, str | None]:
+    """Energy consumed on each lap, in watt-hours.
+
+    Returns (array aligned with `laps`, description of the source used).
+
+    Three sources are tried, most trustworthy first:
+
+      1. A cumulative energy counter (`total_race_energy`). The difference
+         between its value at the end and the start of a lap is that lap's
+         consumption. This is the car's own coulomb-counted accounting, already
+         net of regen, so it beats anything we recompute.
+      2. Integrating the power channel over the lap. Trapezoidal, because power
+         is a continuous signal sampled at intervals — a plain rectangular sum
+         would systematically over-read every acceleration ramp:
+
+             E[J] = sum( (P[i] + P[i+1]) / 2 * dt[i] )
+             E[Wh] = E[J] / 3600                (1 Wh = 3600 J)
+
+         Regen shows up as negative power and is therefore subtracted, giving
+         net consumption on the same basis as source 1.
+      3. A per-lap energy channel (`last_lap_energy`). Used last because it
+         needs an assumption: a channel reporting the LAST lap's energy holds
+         lap N-1's figure while lap N is being driven, so it is read one lap
+         behind and the final lap comes out unknown.
+    """
+    if laps is None or len(laps) == 0:
+        return np.array([]), None
+
+    e_col = CHANNEL_LABELS["energy"]
+    p_col = CHANNEL_LABELS["power"]
+    le_col = CHANNEL_LABELS["lap_energy"]
+    n = len(laps)
+    spans = [(int(r.start_idx), int(r.end_idx))
+             for r in laps.itertuples(index=False)]
+
+    # --- 1. Cumulative counter -------------------------------------------
+    if e_col in df:
+        e = pd.to_numeric(df[e_col], errors="coerce").to_numpy()
+        if np.isfinite(e).sum() >= 2:
+            out = np.full(n, np.nan)
+            for i, (lo, hi) in enumerate(spans):
+                seg = e[lo:hi + 1]
+                seg = seg[np.isfinite(seg)]
+                if seg.size >= 2:
+                    out[i] = float(seg[-1] - seg[0])
+            if np.isfinite(out).any():
+                return out, f"{e_col} counter delta"
+
+    # --- 2. Integrate power ------------------------------------------------
+    if p_col in df:
+        p = pd.to_numeric(df[p_col], errors="coerce").to_numpy()
+        t = df["Time [s]"].to_numpy(dtype=np.float64)
+        if np.isfinite(p).sum() >= 2:
+            out = np.full(n, np.nan)
+            for i, (lo, hi) in enumerate(spans):
+                pt, tt = p[lo:hi + 1], t[lo:hi + 1]
+                good = np.isfinite(pt) & np.isfinite(tt)
+                pt, tt = pt[good], tt[good]
+                if pt.size < 2:
+                    continue
+                joules = float(np.sum((pt[:-1] + pt[1:]) / 2.0 * np.diff(tt)))
+                out[i] = joules / 3600.0
+            if np.isfinite(out).any():
+                return out, f"integrated {p_col}"
+
+    # --- 3. Per-lap channel ------------------------------------------------
+    if le_col in df:
+        le = pd.to_numeric(df[le_col], errors="coerce").to_numpy()
+        if np.isfinite(le).any():
+            out = np.full(n, np.nan)
+            for i in range(n):
+                # Lap i's energy is the value held during lap i+1.
+                if i + 1 >= n:
+                    continue
+                lo, hi = spans[i + 1]
+                seg = le[lo:hi + 1]
+                seg = seg[np.isfinite(seg)]
+                if seg.size:
+                    out[i] = float(np.median(seg))
+            if np.isfinite(out).any():
+                return out, f"{le_col} channel (read one lap behind)"
+
+    return np.full(n, np.nan), None
+
+
+# --------------------------------------------------------------------------
 # Top-level metric computation
 # --------------------------------------------------------------------------
 
@@ -217,7 +350,8 @@ def compute_driver_metrics(name: str, df: pd.DataFrame, laps: pd.DataFrame,
                            target_s: float = TARGET_LAP_TIME_S,
                            mad_k: float = 3.0,
                            drop_first: bool = True,
-                           drop_last: bool = True) -> DriverMetrics:
+                           drop_last: bool = True,
+                           budget_wh: float = ENERGY_BUDGET_WH_PER_LAP) -> DriverMetrics:
     """Compute the full metric set for one driver.
 
     All lap statistics are computed on the KEPT laps only, and the laps that
@@ -273,12 +407,56 @@ def compute_driver_metrics(name: str, df: pd.DataFrame, laps: pd.DataFrame,
         m.notes.append("No throttle channel was found, so smoothness could not "
                        "be scored.")
 
+    # --- Energy ----------------------------------------------------------
+    lap_wh, m.energy_source = energy_per_lap(df, laps)
+    if m.energy_source is None:
+        m.notes.append(
+            "No energy channels were found (power, or voltage + current, or an "
+            "energy counter), so energy consumption could not be measured — "
+            "throttle smoothness is the only efficiency signal available."
+        )
+    elif len(lap_wh):
+        # Energy stats use the same kept laps as the pace stats, so a lap
+        # dropped for traffic does not distort the energy figure either.
+        kept_wh = pd.Series(lap_wh)[keep.to_numpy()] if m.n_laps_used else pd.Series(lap_wh)
+        kept_wh = kept_wh[np.isfinite(kept_wh)]
+        finite_all = lap_wh[np.isfinite(lap_wh)]
+
+        if finite_all.size:
+            m.total_energy_wh = float(np.sum(finite_all))
+        if len(kept_wh):
+            m.median_energy_wh = float(kept_wh.median())
+            m.energy_delta_wh = m.median_energy_wh - budget_wh
+            # Pace-corrected: how much more energy than a lap at THIS pace
+            # should have cost. Positive = energy wasted by how they drove.
+            if np.isfinite(m.median_lap_s):
+                m.energy_excess_wh = (m.median_energy_wh
+                                      - expected_energy_wh(m.median_lap_s))
+
+            # Wh/km normalises away any difference in lap length, so a lap cut
+            # short by a pit entry cannot look artificially efficient.
+            if "Distance [m]" in laps:
+                dist_km = (pd.to_numeric(laps["Distance [m]"], errors="coerce")
+                           .to_numpy() / 1000.0)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    per_km = np.where(dist_km > 0.1, lap_wh / dist_km, np.nan)
+                per_km = pd.Series(per_km)[keep.to_numpy()] if m.n_laps_used else pd.Series(per_km)
+                per_km = per_km[np.isfinite(per_km)]
+                if len(per_km):
+                    m.wh_per_km = float(per_km.median())
+        else:
+            m.notes.append("Energy channels were found but no valid lap had a "
+                           "usable energy figure.")
+
     return m
 
 
 def metrics_table(metrics: list[DriverMetrics],
                   target_s: float = TARGET_LAP_TIME_S) -> pd.DataFrame:
     """Assemble a side-by-side comparison table for the drivers given."""
+    def num(value: float, fmt: str = "{:.2f}") -> str:
+        return fmt.format(value) if np.isfinite(value) else "—"
+
     rows = []
     for m in metrics:
         rows.append({
@@ -287,43 +465,200 @@ def metrics_table(metrics: list[DriverMetrics],
             "Median lap": format_lap_time(m.median_lap_s),
             "Best lap": format_lap_time(m.best_lap_s),
             f"Median Δ vs {format_lap_time(target_s)}": format_delta(m.median_delta_s),
-            "Pace adherence [s]": (f"{m.pace_adherence_s:.2f}"
-                                   if np.isfinite(m.pace_adherence_s) else "—"),
-            "Consistency σ [s]": (f"{m.consistency_s:.2f}"
-                                  if np.isfinite(m.consistency_s) else "—"),
-            "Throttle rate RMS [%/s]": (f"{m.smoothness_rms:.1f}"
-                                        if np.isfinite(m.smoothness_rms) else "—"),
-            "Smoothness score": (f"{m.smoothness_score:.1f}"
-                                 if np.isfinite(m.smoothness_score) else "—"),
+            "Pace adherence [s]": num(m.pace_adherence_s),
+            "Consistency σ [s]": num(m.consistency_s),
+            "Throttle rate RMS [%/s]": num(m.smoothness_rms, "{:.1f}"),
+            "Smoothness score": num(m.smoothness_score, "{:.1f}"),
+            "Energy [Wh/lap]": num(m.median_energy_wh, "{:.1f}"),
+            "Energy excess [Wh/lap]": num(m.energy_excess_wh, "{:+.1f}"),
+            "Efficiency [Wh/km]": num(m.wh_per_km, "{:.1f}"),
         })
     return pd.DataFrame(rows)
 
 
-def rank_drivers(metrics: list[DriverMetrics]) -> pd.DataFrame:
+# --------------------------------------------------------------------------
+# Driver Score — one number per driver, for a leaderboard
+# --------------------------------------------------------------------------
+
+# Half-credit references. Each is the value at which that metric scores 50/100:
+# a driver exactly this far off gets half marks, better scores higher, worse
+# lower. These are engineering judgements about what "good" looks like for a
+# solar endurance stint at Zolder, and they are the numbers to argue with if the
+# leaderboard ever looks wrong.
+SCORE_REFERENCES = {
+    "pace": 2.5,          # s of mean absolute deviation from target
+    "consistency": 2.0,   # s of lap-time standard deviation
+    "energy": 4.0,        # Wh/lap above the pace-matched expectation
+}
+
+# What each metric is worth. Pace and energy lead because they are what the race
+# is actually limited by; consistency is the enabler; smoothness is only a proxy.
+DEFAULT_SCORE_WEIGHTS = {
+    "pace": 0.35,
+    "consistency": 0.25,
+    "energy": 0.30,
+    "smoothness": 0.10,
+}
+
+
+def _diminishing(value: float, ref: float) -> float:
+    """Map a "lower is better" metric onto 0-100 points.
+
+        points = 100 * ref / (ref + value)
+
+    Chosen over a linear scale because it is bounded, always monotonic, and has
+    diminishing returns in both directions: it never goes negative for a very
+    poor value (which would let one bad metric wipe out a whole score), and it
+    cannot run away above 100 for an implausibly good one. It equals 50 exactly
+    at `value == ref`, which is what makes the references above readable.
+
+    Values below zero are clamped to zero, so a driver who beats the expectation
+    (negative energy excess) simply takes full marks rather than over-scoring.
+    """
+    if not np.isfinite(value):
+        return float("nan")
+    return 100.0 * ref / (ref + max(float(value), 0.0))
+
+
+def score_components(m: DriverMetrics) -> dict[str, float]:
+    """The four 0-100 sub-scores behind a driver's overall score."""
+    return {
+        "pace": _diminishing(m.pace_adherence_s, SCORE_REFERENCES["pace"]),
+        "consistency": _diminishing(m.consistency_s, SCORE_REFERENCES["consistency"]),
+        "energy": _diminishing(m.energy_excess_wh, SCORE_REFERENCES["energy"]),
+        "smoothness": m.smoothness_score,
+    }
+
+
+def driver_score(m: DriverMetrics,
+                 weights: dict[str, float] | None = None) -> tuple[float, dict]:
+    """Combine the four metrics into a single 0-100 Driver Score.
+
+    Returns (score, per-component sub-scores).
+
+    Three decisions worth knowing about:
+
+      * **Absolute, not relative.** Each metric is scored against a fixed
+        reference rather than against the other drivers in the comparison. A
+        driver's score therefore does not change when someone else is added to
+        or removed from the upload list, and scores are comparable across
+        sessions. Peer-relative scoring (z-scores, min-max) would make the
+        leaderboard shift under you for reasons that have nothing to do with
+        driving.
+
+      * **Smoothness is deliberately the smallest weight**, and when energy data
+        is missing it inherits energy's weight instead. Smoothness exists to
+        estimate energy waste, so with real watt-hours available it is close to
+        redundant — and the synthetic sweep shows the two can disagree entirely
+        (fast pedal oscillation is filtered out by vehicle inertia and costs
+        almost nothing, while slow surging costs plenty and barely registers as
+        pedal activity).
+
+      * **Missing metrics are dropped, not zeroed.** The weights of whatever is
+        available are renormalised to sum to 1, so a log with no throttle
+        channel yields a slightly less informed score rather than a punished one.
+    """
+    weights = dict(weights or DEFAULT_SCORE_WEIGHTS)
+    parts = score_components(m)
+
+    # Without measured energy, the proxy carries the efficiency weight.
+    if not np.isfinite(parts["energy"]):
+        weights["smoothness"] = weights.get("smoothness", 0.0) + weights.get("energy", 0.0)
+        weights["energy"] = 0.0
+
+    total_w = sum(w for k, w in weights.items()
+                  if w > 0 and np.isfinite(parts.get(k, float("nan"))))
+    if total_w <= 0:
+        return float("nan"), parts
+
+    score = sum(weights[k] * parts[k] for k in weights
+                if weights[k] > 0 and np.isfinite(parts.get(k, float("nan"))))
+    # Clamp: every component is already within [0, 100] and the weights are
+    # renormalised, so this only absorbs floating-point drift at the ends — but
+    # the score is documented as 0-100 and should not print 100.00000000000001.
+    return float(min(100.0, max(0.0, score / total_w))), parts
+
+
+def leaderboard(metrics: list[DriverMetrics],
+                weights: dict[str, float] | None = None) -> pd.DataFrame:
+    """Drivers ordered by Driver Score, best first."""
+    rows = []
+    for m in metrics:
+        if m.n_laps_used == 0:
+            continue
+        score, parts = driver_score(m, weights)
+        rows.append({
+            "Driver": m.name,
+            "Driver score": score,
+            "Pace pts": parts["pace"],
+            "Consistency pts": parts["consistency"],
+            "Energy pts": parts["energy"],
+            "Smoothness pts": parts["smoothness"],
+            "Median lap": format_lap_time(m.median_lap_s),
+            "Pace adherence [s]": m.pace_adherence_s,
+            "Consistency σ [s]": m.consistency_s,
+            "Energy [Wh/lap]": m.median_energy_wh,
+            "Energy excess [Wh/lap]": m.energy_excess_wh,
+            "Throttle rate RMS [%/s]": m.smoothness_rms,
+            "Laps used": f"{m.n_laps_used} / {m.n_laps_total}",
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows).sort_values(
+        "Driver score", ascending=False, na_position="last"
+    ).reset_index(drop=True)
+    out.insert(0, "Pos", range(1, len(out) + 1))
+    return out
+
+
+def rank_drivers(metrics: list[DriverMetrics]) -> tuple[pd.DataFrame, str]:
     """Rank drivers on the metrics, lower rank number being better.
+
+    Returns (table, efficiency column used).
 
     Deliberately simple and transparent: each driver is ranked on each metric
     and the ranks are summed with equal weight. The point is to make the
     trade-offs visible (fast but erratic vs. slower but metronomic), not to
     collapse the decision into one authoritative score.
+
+    Three slots are ranked — pace, consistency, and efficiency — and the
+    efficiency slot takes whichever measure is available:
+
+      * **Energy excess** when the car logged energy. This is the real thing:
+        watt-hours above what a lap at that driver's own pace should cost.
+      * **Throttle rate RMS** otherwise, which is only a proxy for the same
+        quantity.
+
+    Those two are NOT both used. Smoothness exists to estimate energy waste, so
+    ranking on both would weight efficiency twice and quietly outvote pace and
+    consistency together.
     """
     usable = [m for m in metrics if m.n_laps_used > 0]
     if len(usable) < 2:
-        return pd.DataFrame()
+        return pd.DataFrame(), ""
+
+    # Energy is only usable as a ranking column if every driver has it —
+    # otherwise the drivers with data would be ranked against blanks.
+    have_energy = all(np.isfinite(m.energy_excess_wh) for m in usable)
+    eff_col = "Energy excess [Wh/lap]" if have_energy else "Throttle rate RMS [%/s]"
+    eff_vals = [m.energy_excess_wh if have_energy else m.smoothness_rms
+                for m in usable]
 
     df = pd.DataFrame({
         "Driver": [m.name for m in usable],
         "Pace adherence [s]": [m.pace_adherence_s for m in usable],
         "Consistency σ [s]": [m.consistency_s for m in usable],
-        "Throttle rate RMS [%/s]": [m.smoothness_rms for m in usable],
+        eff_col: eff_vals,
     })
 
     # Every column here is "lower is better".
     rank_cols = []
-    for col in ("Pace adherence [s]", "Consistency σ [s]", "Throttle rate RMS [%/s]"):
+    for col in ("Pace adherence [s]", "Consistency σ [s]", eff_col):
         r = f"rank({col})"
         df[r] = df[col].rank(method="min")
         rank_cols.append(r)
 
     df["Total rank"] = df[rank_cols].sum(axis=1)
-    return df.sort_values("Total rank").reset_index(drop=True)
+    return df.sort_values("Total rank").reset_index(drop=True), eff_col

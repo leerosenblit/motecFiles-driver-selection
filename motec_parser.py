@@ -400,6 +400,49 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
     "lap_number": [
         "lap number", "lap num", "lap no", "lap", "lap count", "laps",
     ],
+    # --- energy channels (this is a solar car: energy is the real budget) ---
+    # The team's own telemetry names (bms_voltage_V, mms_power_W, ...) are
+    # included alongside the usual MoTeC spellings, so a log exported from
+    # either pipeline is recognised.
+    "power": [
+        "mms power w", "power", "motor power", "battery power", "pack power",
+        "elec power", "electrical power", "bus power", "motor elec power",
+    ],
+    "voltage": [
+        "bms voltage v", "battery voltage", "pack voltage", "bus voltage",
+        "batt voltage", "voltage",
+    ],
+    "current": [
+        "bms current a", "battery current", "pack current", "bus current",
+        "batt current", "current",
+    ],
+    "energy": [
+        "total race energy", "energy used", "cumulative energy", "total energy",
+        "battery energy used", "energy",
+    ],
+    "lap_energy": ["last lap energy", "lap energy", "energy per lap"],
+    "soc": [
+        "bms soc percent", "state of charge", "battery soc", "soc",
+        "charge level",
+    ],
+}
+
+# Expected units per canonical channel. Used to break ties between candidate
+# channels and — more importantly — to stop a loose prefix match from grabbing
+# the wrong channel: without this, the alias "power" matches the team's
+# "Power Map" (a controller setting, not watts) via prefix.
+CHANNEL_UNIT_HINTS: dict[str, set[str]] = {
+    "speed": {"kmh", "kph", "ms", "mph", "msec", "mpers"},
+    "throttle": {"", "pct", "percent"},
+    "steering": {"deg", "degrees", "rad"},
+    "g_lat": {"g", "ms2", "mss"},
+    "distance": {"m", "km", "mi", "mile", "miles", "ft", "feet"},
+    "power": {"w", "kw", "watt", "watts"},
+    "voltage": {"v", "volt", "volts", "mv"},
+    "current": {"a", "amp", "amps", "ma"},
+    "energy": {"wh", "kwh", "j", "kj", "mj"},
+    "lap_energy": {"wh", "kwh", "j", "kj"},
+    "soc": {"", "pct", "percent"},
 }
 
 # How each canonical channel should be resampled onto the common time grid.
@@ -408,6 +451,7 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
 _RESAMPLE_KIND = {
     "lap_number": "nearest",
     "lap_time": "nearest",
+    "lap_energy": "nearest",       # holds one value per lap, steps at the line
 }
 
 # Display labels, matching the channel names the team uses in i2.
@@ -419,6 +463,12 @@ CHANNEL_LABELS = {
     "distance": "Distance [m]",
     "lap_time": "LapTime [s]",
     "lap_number": "Lap Number",
+    "power": "Power [W]",
+    "voltage": "Battery Voltage [V]",
+    "current": "Battery Current [A]",
+    "energy": "Energy Used [Wh]",
+    "lap_energy": "Lap Energy [Wh]",
+    "soc": "SOC [%]",
 }
 
 
@@ -430,22 +480,54 @@ def _squash(name: str) -> str:
 def identify_channels(log: LDLog) -> dict[str, Channel]:
     """Match the log's channels onto our canonical keys.
 
-    Exact alias matches win; a channel whose squashed name merely *starts with*
-    an alias is accepted as a fallback (e.g. "Throttle Pos Sensor"). Earlier
-    aliases in each list have priority, so "Corr Speed" beats a plain "Speed"
-    when a log carries both.
+    Matching runs in two passes, and the order matters:
+
+      1. Exact alias match, walking each key's alias list in order. Earlier
+         aliases win, so "Corr Speed" beats a plain "Speed" in a log with both.
+      2. Only if nothing matched exactly, a prefix match (so "Throttle Pos
+         Sensor" still resolves) — but a prefix match must also agree with the
+         channel's unit when we have a hint for that quantity.
+
+    The two-pass split and the unit check both exist to stop a loose prefix
+    from beating a real name. With a single pass, the short alias "power" would
+    prefix-match the team's "Power Map" — a controller setting with no unit —
+    and silently feed a map number into the energy calculation.
     """
     squashed = {ch: _squash(ch.name) for ch in log.channels}
     found: dict[str, Channel] = {}
 
+    def unit_ok(key: str, ch: Channel) -> bool:
+        hint = CHANNEL_UNIT_HINTS.get(key)
+        return hint is None or _squash(ch.unit) in hint
+
+    def claim(key: str, ch: Channel) -> bool:
+        """Assign a channel to a key unless it is already used elsewhere."""
+        if ch.name in {c.name for c in found.values()}:
+            return False
+        found[key] = ch
+        return True
+
+    # Pass 1 — exact names. A name that matches exactly is authoritative, so the
+    # unit is only used to choose between several equally exact candidates.
     for key, aliases in CHANNEL_ALIASES.items():
         for alias in aliases:
             a = _squash(alias)
-            hit = next((ch for ch, s in squashed.items() if s == a), None)
-            if hit is None:
-                hit = next((ch for ch, s in squashed.items() if s.startswith(a)), None)
-            if hit is not None and hit.name not in {c.name for c in found.values()}:
-                found[key] = hit
+            hits = [ch for ch, s in squashed.items() if s == a]
+            if not hits:
+                continue
+            preferred = next((c for c in hits if unit_ok(key, c)), hits[0])
+            if claim(key, preferred):
+                break
+
+    # Pass 2 — prefix fallback, unit-gated.
+    for key, aliases in CHANNEL_ALIASES.items():
+        if key in found:
+            continue
+        for alias in aliases:
+            a = _squash(alias)
+            hit = next((ch for ch, s in squashed.items()
+                        if s.startswith(a) and unit_ok(key, ch)), None)
+            if hit is not None and claim(key, hit):
                 break
 
     return found
@@ -482,6 +564,29 @@ def _convert_units(key: str, ch: Channel) -> np.ndarray:
         finite = vals[np.isfinite(vals)]
         if finite.size and np.nanmax(finite) > 10_000:
             vals = vals / 1000.0
+    elif key == "power":
+        if unit in ("kw",):
+            vals = vals * 1000.0
+    elif key == "voltage":
+        if unit in ("mv",):
+            vals = vals / 1000.0
+    elif key == "current":
+        if unit in ("ma",):
+            vals = vals / 1000.0
+    elif key in ("energy", "lap_energy"):
+        # Normalise to watt-hours. 1 Wh = 3600 J.
+        if unit in ("kwh",):
+            vals = vals * 1000.0
+        elif unit in ("j",):
+            vals = vals / 3600.0
+        elif unit in ("kj",):
+            vals = vals / 3.6
+        elif unit in ("mj",):
+            vals = vals * 1000.0 / 3.6
+    elif key == "soc":
+        finite = vals[np.isfinite(vals)]
+        if finite.size and np.nanmax(np.abs(finite)) <= 1.5:
+            vals = vals * 100.0                     # 0-1 fraction -> %
 
     return vals
 
@@ -552,8 +657,52 @@ def to_dataframe(log: LDLog, target_hz: float | None = None,
             ch.time_s, vals, t, _RESAMPLE_KIND.get(key, "linear")
         )
 
+    _derive_power(df, found, log, target_hz)
+
     df.attrs["sample_hz"] = target_hz
     return df, found
+
+
+def _derive_power(df: pd.DataFrame, found: dict[str, Channel],
+                  log: LDLog, target_hz: float) -> None:
+    """Fill in electrical power from pack voltage x current when not logged.
+
+    Most BMS/controller setups log volts and amps rather than watts, so P = V*I
+    is computed here. It is done AFTER resampling on purpose: voltage and
+    current are often logged at different rates, and multiplying two channels on
+    their own separate time bases would pair up samples taken at different
+    moments.
+
+    The derived channel is registered in `found` like any other, so the
+    dashboard's channel-mapping table shows plainly that power was calculated
+    rather than measured.
+    """
+    p_col = CHANNEL_LABELS["power"]
+    v_col, i_col = CHANNEL_LABELS["voltage"], CHANNEL_LABELS["current"]
+
+    if "power" in found or v_col not in df or i_col not in df:
+        return
+
+    power = df[v_col].to_numpy() * df[i_col].to_numpy()
+
+    # Sign convention differs between installations: some log discharge as
+    # positive current, some as negative. A car under load spends most of a lap
+    # discharging, so a negative median means the convention is inverted.
+    # Flip it (and say so) rather than reporting negative energy consumption.
+    finite = power[np.isfinite(power)]
+    if finite.size and np.median(finite) < 0:
+        power = -power
+        log.warnings.append(
+            "Battery current appears to log discharge as negative; the sign was "
+            "inverted so energy consumption comes out positive."
+        )
+
+    df[p_col] = power
+    found["power"] = Channel(
+        name=f"{found['voltage'].name} x {found['current'].name} (derived)",
+        short_name="P(calc)", unit="W",
+        freq=int(target_hz), data=power,
+    )
 
 
 # --------------------------------------------------------------------------

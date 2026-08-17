@@ -8,9 +8,10 @@
 #      binary layout motec_parser reads, so the parser can be exercised
 #      end-to-end without a confidential team log.
 #
-# Run directly to write two sample logs you can then upload in the app:
+# Run directly to write sample logs you can then upload in the app:
 #
-#     python sample_data.py            # -> samples/driver_a.ld, samples/driver_b.ld
+#     python sample_data.py            # -> samples/driver_a.{ld,ldx} + driver_b
+#     python sample_data.py 10         # -> a full ten-driver field
 
 from __future__ import annotations
 
@@ -26,6 +27,40 @@ from motec_parser import _CHAN_FMT, _EVENT_FMT, _HEAD_FMT, _HEAD_SIZE
 # Circuit Zolder, and the pace the energy budget is built around.
 TRACK_LENGTH_M = 4011.0
 TARGET_LAP_S = 210.0
+
+# Vehicle parameters for the energy model. Ballpark solar-car figures, chosen so
+# a smooth lap at the 210 s target lands near the team's 80 Wh/lap budget.
+MASS_KG = 300.0             # car + driver
+# Crr and CdA are calibrated so a lap held at a steady 210 s pace lands on the
+# team's 80 Wh/lap budget from Pit_Dashboard/constants.py.
+CRR = 0.0068                # rolling resistance coefficient
+CDA = 0.112                 # drag area [m^2]
+RHO_AIR = 1.2               # [kg/m^3]
+DRIVETRAIN_EFF = 0.90       # battery -> wheels
+REGEN_EFF = 0.55            # wheels -> battery (the asymmetry is the point)
+AUX_LOAD_W = 35.0           # lights, telemetry, pumps
+PACK_NOMINAL_V = 100.0
+PACK_INTERNAL_OHM = 0.08    # gives a realistic voltage sag under load
+PACK_CAPACITY_WH = 5000.0
+G = 9.81
+
+# Slow speed surging — the mechanism that actually wastes energy on a solar car.
+#
+# Note it is NOT the fast pedal pumping. The car is a low-pass filter with a
+# time constant of order m / (rho*CdA*v) ~ 90 s here, so a pedal oscillating at
+# 1.5 Hz moves the speed by essentially nothing and costs essentially nothing.
+# What costs energy is speed variation on the driver's own timescale — surging
+# and coasting over a few corners — because:
+#
+#   * drag is convex in speed, so mean(v^3) > mean(v)^3: a car that surges uses
+#     more energy than one holding the same average speed; and
+#   * each surge is an accelerate/decelerate cycle, and the drivetrain spends
+#     1/DRIVETRAIN_EFF going out while regen returns only REGEN_EFF.
+#
+# A driver who saws at the pedal usually surges too, so demo_stints sets the two
+# together — but they are separate knobs because they are separate physics, and
+# the dashboard measures them with separate metrics.
+SURGE_FREQS_HZ = (0.07, 0.17)      # periods of ~14 s and ~6 s
 
 # Corner layout as (position along the lap 0-1, severity 0-1, direction).
 # Not a survey of Zolder — a plausible seven-corner rhythm that gives the
@@ -58,6 +93,7 @@ def _lap_profiles(s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
                 median_offset_s: float = 0.0, lap_sigma_s: float = 2.0,
                 pump_amplitude: float = 3.0, pump_hz: float = 0.8,
+                surge_pct: float = 1.5,
                 traffic_laps: dict[int, float] | None = None,
                 seed: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Generate one driver's stint as (dataframe, lap table).
@@ -66,6 +102,7 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
       median_offset_s  shifts the driver's median lap off the 210 s target
       lap_sigma_s      lap-to-lap scatter, i.e. their consistency
       pump_amplitude   extra throttle oscillation, i.e. their smoothness
+      surge_pct        slow speed variation, i.e. their energy consumption
       traffic_laps     {lap number: seconds lost} to plant outlier laps
     """
     rng = np.random.default_rng(seed)
@@ -74,9 +111,11 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
     t_parts, speed_parts, thr_parts = [], [], []
     steer_parts, glat_parts, dist_parts = [], [], []
     lapno_parts, laptime_parts = [], []
+    power_parts, volt_parts, curr_parts, soc_parts = [], [], [], []
 
     t_cursor = 0.0
     dist_cursor = 0.0
+    energy_cursor = 0.0
     rows = []
 
     for lap in range(1, n_laps + 1):
@@ -93,6 +132,21 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         s = t_lap / lap_time                      # fraction of the lap covered
 
         rel_speed, steer = _lap_profiles(s)
+
+        # `pump_hz` is the real oscillation frequency of the pedal — around
+        # 1-2 Hz for a driver who saws at it, well under 0.5 Hz for a smooth one.
+        # This drives the throttle trace (and so the smoothness metric) only:
+        # vehicle inertia keeps it out of the speed trace.
+        pump = pump_amplitude * np.sin(2 * np.pi * pump_hz * t_lap)
+
+        # Slow surging, which is what actually costs energy. Two harmonics with
+        # a per-driver phase so no two stints surge in lockstep.
+        f1, f2 = SURGE_FREQS_HZ
+        phase = rng.uniform(0, 2 * np.pi, 2)
+        surge = (np.sin(2 * np.pi * f1 * t_lap + phase[0])
+                 + 0.6 * np.sin(2 * np.pi * f2 * t_lap + phase[1])) / 1.6
+        rel_speed = rel_speed * (1.0 + surge_pct / 100.0 * surge)
+
         # Scale the profile so this lap really covers the track length in the
         # lap time: mean(speed) = length / time.
         speed = rel_speed * (TRACK_LENGTH_M / lap_time) / float(np.mean(rel_speed))
@@ -103,12 +157,30 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         # is designed to catch.
         accel = np.gradient(speed, t_lap)
         base = 55.0 + 40.0 * np.tanh(accel / 0.6)
-        # `pump_hz` is the real oscillation frequency of the pedal — around
-        # 1-2 Hz for a driver who saws at it, well under 0.5 Hz for a smooth one.
-        pump = pump_amplitude * np.sin(2 * np.pi * pump_hz * t_lap)
         # A fixed 0.3% sensor noise floor. Deliberately independent of the
         # driver knobs: sensor noise is a property of the car, not the driver.
         thr = np.clip(base + pump + rng.normal(0.0, 0.3, n), 0.0, 100.0)
+
+        # --- Electrical channels ------------------------------------------
+        # Tractive force: inertia + rolling resistance + aerodynamic drag.
+        force = MASS_KG * accel + CRR * MASS_KG * G + 0.5 * RHO_AIR * CDA * speed ** 2
+        p_mech = force * speed
+        # Losses run one way going out and the other coming back, so an
+        # oscillating driver pays DRIVETRAIN_EFF on the way out and only gets
+        # REGEN_EFF back — that asymmetry is what a pumper is charged for.
+        p_elec = np.where(p_mech > 0, p_mech / DRIVETRAIN_EFF,
+                          p_mech * REGEN_EFF) + AUX_LOAD_W
+
+        # Pack current from P = V*I with V sagging as V_oc - I*R:
+        #   R*I^2 - V_oc*I + P = 0  ->  I = (V_oc - sqrt(V_oc^2 - 4*R*P)) / (2R)
+        disc = np.maximum(PACK_NOMINAL_V ** 2 - 4.0 * PACK_INTERNAL_OHM * p_elec, 0.0)
+        current = (PACK_NOMINAL_V - np.sqrt(disc)) / (2.0 * PACK_INTERNAL_OHM)
+        voltage = PACK_NOMINAL_V - current * PACK_INTERNAL_OHM
+
+        # Running energy total, so SOC falls realistically across the stint.
+        dt = np.diff(t_lap, prepend=t_lap[0])
+        energy_wh = energy_cursor + np.cumsum(p_elec * dt) / 3600.0
+        soc = 95.0 - 100.0 * energy_wh / PACK_CAPACITY_WH
 
         steer = steer + rng.normal(0.0, 1.2, n)
         # Lateral acceleration from the steering geometry: a_lat = v^2 / R, and
@@ -128,10 +200,16 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         dist_parts.append(dist)
         lapno_parts.append(np.full(n, lap, dtype=float))
         laptime_parts.append(t_lap)               # running timer, resets at the line
+        power_parts.append(p_elec)
+        volt_parts.append(voltage)
+        curr_parts.append(current)
+        soc_parts.append(soc)
 
-        rows.append({"Lap": lap, "LapTime [s]": lap_time})
+        rows.append({"Lap": lap, "LapTime [s]": lap_time,
+                     "Energy [Wh]": float(energy_wh[-1] - energy_cursor)})
         t_cursor += n / freq
         dist_cursor = dist[-1]
+        energy_cursor = float(energy_wh[-1])
 
     df = pd.DataFrame({
         "Time [s]": np.concatenate(t_parts),
@@ -142,29 +220,55 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         "Distance [m]": np.concatenate(dist_parts),
         "LapTime [s]": np.concatenate(laptime_parts),
         "Lap Number": np.concatenate(lapno_parts),
+        "Power [W]": np.concatenate(power_parts),
+        "Battery Voltage [V]": np.concatenate(volt_parts),
+        "Battery Current [A]": np.concatenate(curr_parts),
+        "SOC [%]": np.concatenate(soc_parts),
     })
     df.attrs["sample_hz"] = freq
     df.attrs["driver"] = name
     return df, pd.DataFrame(rows)
 
 
-def demo_stints() -> dict[str, pd.DataFrame]:
-    """Two contrasting drivers, so the comparison has something to say.
+# A squad of ten, as (name, kwargs). The first two are deliberately the classic
+# trade-off — A is quicker but scruffy and thirsty, B sits on the target and is
+# smooth and frugal — so the default two-driver demo has a real decision in it.
+# The rest spread across the plausible range so a leaderboard has a field to sort.
+DEMO_DRIVERS = [
+    ("Driver A", dict(median_offset_s=-2.6, lap_sigma_s=3.1, pump_amplitude=9.0,
+                      pump_hz=1.5, surge_pct=4.0, traffic_laps={6: 41.0}, seed=11)),
+    ("Driver B", dict(median_offset_s=+0.4, lap_sigma_s=1.2, pump_amplitude=2.5,
+                      pump_hz=0.35, surge_pct=0.8, traffic_laps={9: 28.0}, seed=29)),
+    ("Driver C", dict(median_offset_s=+1.8, lap_sigma_s=1.6, pump_amplitude=4.0,
+                      pump_hz=0.7, surge_pct=1.6, seed=37)),
+    ("Driver D", dict(median_offset_s=-1.2, lap_sigma_s=2.4, pump_amplitude=6.5,
+                      pump_hz=1.1, surge_pct=3.0, traffic_laps={4: 33.0}, seed=43)),
+    ("Driver E", dict(median_offset_s=+0.1, lap_sigma_s=0.9, pump_amplitude=2.0,
+                      pump_hz=0.3, surge_pct=1.0, seed=51)),
+    ("Driver F", dict(median_offset_s=+3.4, lap_sigma_s=2.9, pump_amplitude=5.0,
+                      pump_hz=0.9, surge_pct=2.2, traffic_laps={11: 36.0}, seed=59)),
+    ("Driver G", dict(median_offset_s=-0.6, lap_sigma_s=1.4, pump_amplitude=3.0,
+                      pump_hz=0.5, surge_pct=1.3, seed=67)),
+    ("Driver H", dict(median_offset_s=+2.2, lap_sigma_s=3.6, pump_amplitude=7.5,
+                      pump_hz=1.3, surge_pct=3.6, seed=73)),
+    ("Driver I", dict(median_offset_s=-3.1, lap_sigma_s=2.0, pump_amplitude=5.5,
+                      pump_hz=1.0, surge_pct=2.6, traffic_laps={7: 30.0}, seed=79)),
+    ("Driver J", dict(median_offset_s=+1.1, lap_sigma_s=1.1, pump_amplitude=2.2,
+                      pump_hz=0.4, surge_pct=1.1, seed=83)),
+]
 
-    Driver A is quicker but scruffier on the pedal; driver B sits almost exactly
-    on the 210 s target and is smoother. Which one you want depends on whether
-    the strategy is chasing lap time or energy — which is the decision the
-    dashboard exists to inform.
+
+def demo_stints(n_drivers: int = 2, n_laps: int = 14) -> dict:
+    """Generate `n_drivers` contrasting synthetic stints (1-10).
+
+    Two drivers is the head-to-head case; three or more brings up the
+    leaderboard, so the whole dashboard is reviewable without a real export.
     """
-    a_df, a_laps = synth_stint(
-        "Driver A", n_laps=14, median_offset_s=-2.6, lap_sigma_s=3.1,
-        pump_amplitude=9.0, pump_hz=1.5, traffic_laps={6: 41.0}, seed=11,
-    )
-    b_df, b_laps = synth_stint(
-        "Driver B", n_laps=14, median_offset_s=+0.4, lap_sigma_s=1.2,
-        pump_amplitude=2.5, pump_hz=0.35, traffic_laps={9: 28.0}, seed=29,
-    )
-    return {"Driver A": (a_df, a_laps), "Driver B": (b_df, b_laps)}
+    n_drivers = max(1, min(int(n_drivers), len(DEMO_DRIVERS)))
+    out = {}
+    for name, kwargs in DEMO_DRIVERS[:n_drivers]:
+        out[name] = synth_stint(name, n_laps=n_laps, **kwargs)
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -183,6 +287,12 @@ _SAMPLE_CHANNELS = [
     ("Distance [m]", "Distance", "Dist", "m", 5),
     ("LapTime [s]", "Lap Time", "LapT", "s", 5),
     ("Lap Number", "Lap Number", "LapNo", "", 5),
+    # Voltage and current are written but Power is NOT, so an uploaded sample
+    # exercises the parser's P = V*I derivation. The in-memory demo keeps its
+    # Power column, so both routes to energy get used somewhere.
+    ("Battery Voltage [V]", "Battery Voltage", "BattV", "V", 10),
+    ("Battery Current [A]", "Battery Current", "BattA", "A", 10),
+    ("SOC [%]", "SOC", "SOC", "%", 1),
 ]
 
 
@@ -297,9 +407,13 @@ def write_ldx(path: str, laps: pd.DataFrame) -> str:
 
 
 if __name__ == "__main__":
+    import sys
+
+    # `python sample_data.py [n]` — n stints, default 2, up to 10.
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 2
     here = os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.join(here, "samples")
-    for label, (frame, laps) in demo_stints().items():
+    for label, (frame, laps) in demo_stints(count).items():
         slug = label.lower().replace(" ", "_")
         ld = write_ld(os.path.join(out_dir, f"{slug}.ld"), frame, driver=label)
         ldx = write_ldx(os.path.join(out_dir, f"{slug}.ldx"), laps)

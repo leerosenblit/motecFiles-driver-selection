@@ -39,7 +39,7 @@ def test_header_round_trips(ld_path):
     assert log.driver == "Test Driver"
     assert log.venue == "Zolder"
     assert log.warnings == []
-    assert len(log.channels) == 7
+    assert len(log.channels) == 10
 
 
 def test_channel_values_and_rates_round_trip(ld_path, stint):
@@ -79,7 +79,8 @@ def test_resampling_puts_all_channels_on_one_grid(ld_path):
     df, found = P.to_dataframe(log, max_hz=25.0)
 
     assert set(found) == {"speed", "throttle", "steering", "g_lat",
-                          "distance", "lap_time", "lap_number"}
+                          "distance", "lap_time", "lap_number",
+                          "voltage", "current", "soc", "power"}
     assert df["Time [s]"].is_monotonic_increasing
     # One row count for every channel, and no gaps left by the resample.
     for key in found:
@@ -157,9 +158,12 @@ def test_laps_from_distance_resets(stint):
 def test_laps_from_ldx_markers(stint):
     """Beacon markers in the .ldx define the laps when no channel does."""
     df, src_laps = stint
-    starts = [0.0]
-    for t in src_laps["LapTime [s]"]:
-        starts.append(starts[-1] + float(t))
+    # Beacon times taken from the actual lap boundaries in the log. Deriving
+    # them from idealised cumulative lap times instead would drift against the
+    # sample grid by a fraction of a sample per lap, which is an artefact of the
+    # synthetic data rather than anything a real .ldx does.
+    grid = P.build_lap_table(df)
+    starts = grid["Start [s]"].tolist() + [float(grid["End [s]"].iloc[-1])]
 
     ldx = "<LDXFile><Layers><Layer><MarkerBlock><MarkerGroup>" + "".join(
         f'<Marker Time="{int(round(t * 1e6))}" Name=""/>' for t in starts
@@ -172,7 +176,8 @@ def test_laps_from_ldx_markers(stint):
     laps = P.apply_ldx_laps(df.drop(columns=["Lap Number", "LapTime [s]"]), markers)
     assert laps.attrs["lap_source"] == ".ldx beacon markers"
     assert len(laps) == len(src_laps)
-    assert np.allclose(laps["LapTime [s]"], src_laps["LapTime [s]"], atol=0.02)
+    # Beacon differences are authoritative, so they come back verbatim.
+    assert np.allclose(laps["LapTime [s]"], np.diff(starts), atol=0.02)
 
 
 def test_ldx_unit_autodetection(stint):
@@ -393,8 +398,11 @@ def test_ranking_orders_the_better_driver_first():
         laps = P.build_lap_table(frame)
         ms.append(M.compute_driver_metrics(name, P.add_lap_columns(frame, laps), laps))
 
-    ranking = M.rank_drivers(ms)
+    ranking, eff_col = M.rank_drivers(ms)
     assert ranking.iloc[0]["Driver"] == "good"
+    # With energy channels present the efficiency slot must be the measurement,
+    # not the smoothness proxy.
+    assert eff_col == "Energy excess [Wh/lap]"
 
 
 def test_lap_time_formatting():

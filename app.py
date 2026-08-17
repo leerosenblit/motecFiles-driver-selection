@@ -38,11 +38,18 @@ if get_script_run_ctx() is None:
     )
 
 from metrics import (
+    DEFAULT_SCORE_WEIGHTS,
+    ENERGY_BUDGET_WH_PER_LAP,
+    SCORE_REFERENCES,
+    STRATEGY_REFERENCE,
     TARGET_LAP_TIME_S,
     compute_driver_metrics,
+    energy_per_lap,
+    expected_energy_wh,
     flag_outlier_laps,
     format_delta,
     format_lap_time,
+    leaderboard,
     metrics_table,
     rank_drivers,
 )
@@ -55,7 +62,13 @@ from motec_parser import (
     read_ldx_markers,
     to_dataframe,
 )
-from plots import lap_pace_chart, overlay_chart, series_color
+from plots import (
+    MAX_DRIVERS,
+    energy_chart,
+    lap_pace_chart,
+    overlay_chart,
+    series_color,
+)
 
 st.set_page_config(
     page_title="Driver Selection — MoTeC Telemetry",
@@ -133,12 +146,12 @@ def load_stint(ld_bytes: bytes, ldx_bytes: bytes | None,
 
 
 @st.cache_data(show_spinner=False)
-def load_demo(max_hz: float) -> dict[str, dict]:
-    """Build the two demo stints through the same pipeline as a real upload."""
+def load_demo(max_hz: float, n_drivers: int = 2) -> dict[str, dict]:
+    """Build the demo stints through the same pipeline as a real upload."""
     from sample_data import demo_stints
 
     out = {}
-    for label, (frame, _laps) in demo_stints().items():
+    for label, (frame, _laps) in demo_stints(n_drivers).items():
         laps = build_lap_table(frame)
         lap_source = laps.attrs.get("lap_source", "unknown")
         out[label] = {
@@ -176,13 +189,28 @@ source = st.sidebar.radio(
 )
 
 uploads: list[dict] = []
-if source == "Upload MoTeC logs":
+n_demo = 2
+if source == "Demo data":
+    n_demo = st.sidebar.number_input(
+        "Demo drivers", min_value=1, max_value=MAX_DRIVERS, value=2, step=1,
+        key="n_demo",
+        help="Two gives the head-to-head; three or more brings up the leaderboard.",
+    )
+elif source == "Upload MoTeC logs":
+    # Default 2 (the head-to-head case), openable up to a full squad of 10.
+    n_drivers = st.sidebar.number_input(
+        "Drivers to compare", min_value=1, max_value=MAX_DRIVERS, value=2, step=1,
+        key="n_drivers",
+        help=f"How many upload slots to show, 1 to {MAX_DRIVERS}. Slots you "
+             "leave empty are ignored, so you can raise this and fill them in "
+             "as logs arrive.",
+    )
     st.sidebar.caption(
-        "Upload one log for a single-driver report, or two for a head-to-head. "
+        "One log gives a single-driver report; two or more compare them. "
         "The `.ldx` is optional — add it if beacons were edited in i2."
     )
-    for slot in (1, 2):
-        with st.sidebar.expander(f"Driver {slot}" + ("" if slot == 1 else "  (optional)"),
+    for slot in range(1, int(n_drivers) + 1):
+        with st.sidebar.expander(f"Driver {slot}" + ("" if slot <= 2 else "  (optional)"),
                                  expanded=(slot == 1)):
             ld = st.file_uploader(f"`.ld` log — driver {slot}", type=["ld"],
                                   key=f"ld_{slot}")
@@ -200,6 +228,13 @@ target_s = st.sidebar.number_input(
     help="The energy-budget lap. Default 210 s = 3:30.",
 )
 st.sidebar.caption(f"Target = **{format_lap_time(target_s)}**")
+
+budget_wh = st.sidebar.number_input(
+    "Energy budget [Wh/lap]", min_value=1.0, max_value=2000.0,
+    value=float(ENERGY_BUDGET_WH_PER_LAP), step=1.0, key="budget_wh",
+    help="Watt-hours per lap the strategy allows. Default 80 Wh, matching the "
+         "team's Base (210 s) strategy.",
+)
 
 lap_source_choice = st.sidebar.selectbox(
     "Lap division", ["Auto (from the log)", "Prefer .ldx beacons"], key="lap_div",
@@ -220,6 +255,29 @@ with st.sidebar.expander("Lap filtering", expanded=False):
              "median are treated as traffic or yellow-flag laps. Lower = stricter.",
     )
 
+with st.sidebar.expander("Driver score weights", expanded=False):
+    st.caption(
+        "How much each metric counts toward the Driver Score on the leaderboard "
+        "(shown from three drivers up). Weights are renormalised, so only their "
+        "relative size matters."
+    )
+    w_pace = st.slider("Pace adherence", 0.0, 1.0,
+                       DEFAULT_SCORE_WEIGHTS["pace"], 0.05, key="w_pace")
+    w_cons = st.slider("Consistency", 0.0, 1.0,
+                       DEFAULT_SCORE_WEIGHTS["consistency"], 0.05, key="w_cons")
+    w_energy = st.slider("Energy", 0.0, 1.0,
+                         DEFAULT_SCORE_WEIGHTS["energy"], 0.05, key="w_energy")
+    w_smooth = st.slider("Smoothness", 0.0, 1.0,
+                         DEFAULT_SCORE_WEIGHTS["smoothness"], 0.05, key="w_smooth")
+
+    raw_weights = {"pace": w_pace, "consistency": w_cons,
+                   "energy": w_energy, "smoothness": w_smooth}
+    if sum(raw_weights.values()) <= 0:
+        st.caption(":warning: All weights are zero — falling back to the defaults.")
+        score_weights = dict(DEFAULT_SCORE_WEIGHTS)
+    else:
+        score_weights = raw_weights
+
 with st.sidebar.expander("Sampling", expanded=False):
     max_hz = st.slider(
         "Resample cap [Hz]", min_value=5, max_value=50, value=25, step=5,
@@ -239,8 +297,9 @@ stints: list[dict] = []
 lap_pref = "ldx" if lap_source_choice.startswith("Prefer") else "auto"
 
 if source == "Demo data":
-    for label, stint in load_demo(float(max_hz)).items():
-        stints.append(stint)
+    with st.spinner(f"Generating {int(n_demo)} synthetic stint(s)…"):
+        for label, stint in load_demo(float(max_hz), int(n_demo)).items():
+            stints.append(stint)
 else:
     for slot, up in enumerate(uploads, start=1):
         if up["ld"] is None:
@@ -279,10 +338,18 @@ if not stints:
 | **Median lap time** | Median of the valid laps | Robust to one lap lost in traffic, unlike the mean |
 | **Pace adherence** | Mean of \\|lap − {format_lap_time(target_s)}\\| | Both directions are failures: under target burns energy we don't have, over it loses distance |
 | **Consistency** | Standard deviation of lap times | A metronomic driver is a predictable energy budget |
-| **Smoothness** | Variance of d(Throttle)/dt, in (%/s)² | Rewards a driver who eases the pedal; pedal pumping wastes energy |
+| **Smoothness** | Variance of d(Throttle)/dt, in (%/s)² | A proxy for efficiency where no energy channel exists |
+| **Energy** | Wh per lap, and Wh above what that pace should cost | This is a solar car: energy is the binding constraint |
+
+With three or more drivers, a **leaderboard** combines all four into a single
+0-100 Driver Score.
 
 Required channels: `LapTime`, `Throttle Pos [%]`, `Steering Angle [deg]`,
 `G Force Lat [G]`, `Corr Speed [km/h]`, `Distance [m]`.
+
+For energy, any one of: a power channel (`mms_power_W`, `Power`), pack
+**voltage + current** (`bms_voltage_V` + `bms_current_A`), or a cumulative
+energy counter (`total_race_energy`).
 """
         )
     st.stop()
@@ -306,6 +373,7 @@ for i, s in enumerate(stints):
 
 all_metrics = []
 keep_masks = []
+lap_energy = []
 for s in stints:
     keep = flag_outlier_laps(s["laps"]["LapTime [s]"], mad_k=mad_k,
                              drop_first=drop_first, drop_last=drop_last) \
@@ -314,7 +382,11 @@ for s in stints:
     all_metrics.append(compute_driver_metrics(
         s["driver"], s["df"], s["laps"], target_s=target_s,
         mad_k=mad_k, drop_first=drop_first, drop_last=drop_last,
+        budget_wh=budget_wh,
     ))
+    lap_energy.append(energy_per_lap(s["df"], s["laps"])[0])
+
+any_energy = any(np.isfinite(np.asarray(e, dtype=float)).any() for e in lap_energy)
 
 
 def driver_heading(name: str, index: int, subtitle: str = "") -> None:
@@ -336,8 +408,23 @@ def driver_heading(name: str, index: int, subtitle: str = "") -> None:
 
 st.subheader("Driver metrics")
 
+# Five metric cards per driver reads well up to about four drivers; past that the
+# page becomes a wall of tiles, so the comparison table leads instead and the
+# cards move into an expander.
+CARD_LIMIT = 4
+cards_inline = len(all_metrics) <= CARD_LIMIT
+card_host = (st.container() if cards_inline
+             else st.expander(f"Per-driver metric cards ({len(all_metrics)} drivers)",
+                              expanded=False))
+if not cards_inline:
+    st.caption(
+        f"With more than {CARD_LIMIT} drivers the side-by-side table below is the "
+        "clearer read; the individual metric cards are in the expander."
+    )
+
 baseline = all_metrics[0]
 for i, (s, m) in enumerate(zip(stints, all_metrics)):
+  with card_host:
     bits = [f"{m.n_laps_used}/{m.n_laps_total} laps used"]
     if s["venue"]:
         bits.append(s["venue"])
@@ -345,10 +432,10 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
         bits.append(s["session"])
     driver_heading(m.name, i, " · ".join(bits))
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
 
-    # For the second driver every metric also carries its delta vs the first, so
-    # the comparison is readable without arithmetic.
+    # Every driver after the first also carries its delta vs the first, so the
+    # comparison is readable without arithmetic.
     def delta(value: float, base: float, digits: int = 2) -> str | None:
         if i == 0 or not (np.isfinite(value) and np.isfinite(base)):
             return None
@@ -382,8 +469,23 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
         delta_color="normal",            # higher score is better
         help=(f"Throttle rate RMS {m.smoothness_rms:.1f} %/s "
               f"(variance {m.smoothness_var:,.0f} (%/s)²). Higher score = "
-              "smoother pedal = less wasted energy.")
+              "smoother pedal. A proxy for efficiency — where energy channels "
+              "exist, the energy figure measures it directly.")
         if np.isfinite(m.smoothness_rms) else "No throttle channel found.",
+    )
+    c5.metric(
+        "Energy per lap",
+        f"{m.median_energy_wh:.1f} Wh" if np.isfinite(m.median_energy_wh) else "—",
+        delta=delta(m.median_energy_wh, baseline.median_energy_wh, digits=1),
+        delta_color="inverse",           # fewer watt-hours is better
+        help=(f"Median over the valid laps. Budget {budget_wh:.0f} Wh "
+              f"({format_delta(m.energy_delta_wh).replace(' s', ' Wh')}). "
+              f"A lap at this driver's own pace should cost "
+              f"{expected_energy_wh(m.median_lap_s):.1f} Wh, so "
+              f"{m.energy_excess_wh:+.1f} Wh is down to how they drove. "
+              f"Efficiency {m.wh_per_km:.1f} Wh/km. Source: {m.energy_source}.")
+        if np.isfinite(m.median_energy_wh)
+        else "No power, voltage+current, or energy channel found in this log.",
     )
 
     if m.excluded_laps:
@@ -399,27 +501,96 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
 # Comparison table + ranking
 # --------------------------------------------------------------------------
 
+# From three drivers up, a single ordered leaderboard is the useful view — a
+# pairwise "who won" reading stops working once there is a field.
+if len(all_metrics) >= 3:
+    st.subheader("Leaderboard")
+
+    board = leaderboard(all_metrics, weights=score_weights)
+    if len(board):
+        leader = board.iloc[0]
+        st.markdown(
+            f"**{leader['Driver']}** leads on Driver Score with "
+            f"**{leader['Driver score']:.1f}/100**"
+            + (f", ahead of {board.iloc[1]['Driver']} on "
+               f"{board.iloc[1]['Driver score']:.1f}." if len(board) > 1 else ".")
+        )
+
+        show = board[["Pos", "Driver", "Driver score", "Pace pts",
+                      "Consistency pts", "Energy pts", "Smoothness pts",
+                      "Median lap", "Laps used"]]
+        st.dataframe(
+            show, hide_index=True, width="stretch",
+            column_config={
+                "Driver score": st.column_config.ProgressColumn(
+                    "Driver score", min_value=0, max_value=100,
+                    format="%.1f", help="Weighted 0-100 composite of all four metrics.",
+                ),
+                **{c: st.column_config.NumberColumn(c, format="%.0f")
+                   for c in ("Pace pts", "Consistency pts", "Energy pts",
+                             "Smoothness pts")},
+            },
+        )
+
+        with st.expander("How the Driver Score is calculated"):
+            st.markdown(
+                f"""
+Each metric is scored 0-100 against a fixed reference — the value worth exactly
+half marks — then combined with the weights in the sidebar:
+
+| Metric | Half-credit reference | Weight |
+|---|---|---|
+| Pace adherence | {SCORE_REFERENCES['pace']:.1f} s from target | {score_weights['pace']:.0%} |
+| Consistency (σ) | {SCORE_REFERENCES['consistency']:.1f} s | {score_weights['consistency']:.0%} |
+| Energy excess | {SCORE_REFERENCES['energy']:.1f} Wh/lap over pace-matched | {score_weights['energy']:.0%} |
+| Smoothness | throttle-rate variance | {score_weights['smoothness']:.0%} |
+
+`points = 100 · ref / (ref + value)` — bounded, always monotonic, and equal to
+50 exactly at the reference. It can't go negative, so one bad metric can't wipe
+out an otherwise strong driver, and it can't run away above 100 either.
+
+**Scored against fixed references, not against each other.** Adding or removing
+a driver never changes anyone else's score, and scores are comparable between
+sessions. Peer-relative scoring would make the board shift for reasons that have
+nothing to do with driving.
+
+**Smoothness carries the smallest weight on purpose.** It is a *proxy* for energy
+waste, so where real watt-hours exist it is nearly redundant — and the two can
+disagree outright: fast pedal oscillation is filtered out by the car's inertia
+and costs almost nothing, while slow surging costs plenty and barely shows up as
+pedal activity. When a log has no energy channels, smoothness inherits energy's
+weight instead.
+
+Missing metrics are dropped and the remaining weights renormalised, so an
+incomplete log gives a less informed score rather than a punished one.
+"""
+            )
+            st.dataframe(board, hide_index=True, width="stretch")
+
 if len(all_metrics) >= 2:
     st.subheader("Side-by-side")
     st.dataframe(metrics_table(all_metrics, target_s=target_s),
                  hide_index=True, width="stretch")
 
-    ranking = rank_drivers(all_metrics)
+    ranking, eff_col = rank_drivers(all_metrics)
     if len(ranking):
         winner = ranking.iloc[0]
         st.markdown(
             f"On equally-weighted ranks across pace adherence, consistency and "
-            f"throttle smoothness, **{winner['Driver']}** comes out ahead "
-            f"(total rank {winner['Total rank']:.0f} vs "
+            f"{eff_col.split(' [')[0].lower()}, **{winner['Driver']}** comes out "
+            f"ahead (total rank {winner['Total rank']:.0f} vs "
             f"{ranking.iloc[1]['Total rank']:.0f})."
         )
         with st.expander("How that ranking was computed"):
             st.dataframe(ranking, hide_index=True, width="stretch")
             st.caption(
-                "Each driver is ranked 1..N on each metric (lower is better in "
-                "all three) and the ranks are summed with equal weight. It is "
-                "deliberately transparent rather than a tuned score — the point "
-                "is to expose the trade-off, not to hide it behind a weighting."
+                f"Each driver is ranked 1..N on each metric (lower is better in "
+                f"all three) and the ranks are summed with equal weight. The "
+                f"efficiency slot used **{eff_col}** — energy when the car logged "
+                f"it, throttle smoothness as a proxy when it did not. Only one of "
+                f"the two is used, since ranking on both would weight efficiency "
+                f"twice. This is a deliberately different method from the Driver "
+                f"Score above, so agreement between them is a useful check."
             )
 
 # --------------------------------------------------------------------------
@@ -429,7 +600,7 @@ if len(all_metrics) >= 2:
 st.subheader("Lap-by-lap pace")
 
 pace_stints = [
-    {"name": s["driver"], "laps": s["laps"], "keep": keep_masks[i]}
+    {"name": s["driver"], "laps": s["laps"], "keep": keep_masks[i], "slot": i}
     for i, s in enumerate(stints) if len(s["laps"])
 ]
 if pace_stints:
@@ -459,22 +630,112 @@ if pace_stints:
             )
 
 # --------------------------------------------------------------------------
+# Energy consumption
+# --------------------------------------------------------------------------
+
+st.subheader("Energy consumption")
+
+if not any_energy:
+    st.info(
+        "**No energy data in these logs.** To measure consumption the log needs "
+        "one of: a power channel (`mms_power_W`, `Power`), pack **voltage and "
+        "current** (`bms_voltage_V` + `bms_current_A`) from which power is "
+        "derived, or a cumulative energy counter (`total_race_energy`). Without "
+        "any of them, throttle smoothness is the only efficiency signal — and it "
+        "is a proxy, not a measurement."
+    )
+else:
+    energy_stints = [
+        {"name": s["driver"], "laps": s["laps"], "keep": keep_masks[i],
+         "energy": lap_energy[i], "slot": i}
+        for i, s in enumerate(stints) if len(s["laps"])
+    ]
+    st.plotly_chart(
+        energy_chart(energy_stints, budget_wh=budget_wh, mode=MODE),
+        width="stretch",
+        config={"displaylogo": False},
+    )
+    st.caption(
+        f"The dashed line is the {budget_wh:.0f} Wh/lap budget. Read this "
+        "together with the pace chart above: a driver under the budget but off "
+        "the pace target is not saving energy, only losing distance."
+    )
+
+    with st.expander("Pace vs energy — the team's strategy table"):
+        st.caption(
+            "Raw watt-hours alone would reward whoever drove slowest, so the "
+            "dashboard also reports **energy excess**: consumption minus what a "
+            "lap at that driver's own median pace should cost, interpolated from "
+            "this table. Positive excess is energy spent on how they drove "
+            "rather than on how fast they went."
+        )
+        strat = pd.DataFrame(STRATEGY_REFERENCE,
+                             columns=["Strategy", "Lap time [s]", "Energy [Wh/lap]"])
+        strat["Lap time"] = strat["Lap time [s]"].map(format_lap_time)
+        st.dataframe(strat[["Strategy", "Lap time", "Energy [Wh/lap]"]],
+                     hide_index=True, width="stretch")
+
+        rows = []
+        for m in all_metrics:
+            if not np.isfinite(m.median_energy_wh):
+                continue
+            rows.append({
+                "Driver": m.name,
+                "Median lap": format_lap_time(m.median_lap_s),
+                "Actual [Wh/lap]": round(m.median_energy_wh, 1),
+                "Expected at that pace [Wh]": round(expected_energy_wh(m.median_lap_s), 1),
+                "Excess [Wh/lap]": round(m.energy_excess_wh, 1),
+                "Efficiency [Wh/km]": round(m.wh_per_km, 1),
+                "Stint total [Wh]": round(m.total_energy_wh, 0),
+                "Source": m.energy_source,
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    with st.expander("Table view — energy per lap"):
+        for i, s in enumerate(stints):
+            e = np.asarray(lap_energy[i], dtype=float)
+            if not len(s["laps"]) or not np.isfinite(e).any():
+                continue
+            table = s["laps"][["Lap"]].copy()
+            table["Lap time"] = s["laps"]["LapTime [s]"].map(format_lap_time)
+            table["Energy [Wh]"] = np.round(e, 1)
+            table["Δ vs budget [Wh]"] = np.round(e - budget_wh, 1)
+            table["Used"] = keep_masks[i].to_numpy()
+            driver_heading(s["driver"], i)
+            st.dataframe(table, hide_index=True, width="stretch")
+
+# --------------------------------------------------------------------------
 # Head-to-head telemetry overlay
 # --------------------------------------------------------------------------
 
 st.subheader("Telemetry overlay")
 
-usable = [(i, s) for i, s in enumerate(stints) if len(s["laps"])]
-if not usable:
+available = [(i, s) for i, s in enumerate(stints) if len(s["laps"])]
+if not available:
     st.info("No laps available to overlay.")
 else:
-    if len(usable) == 1:
+    if len(available) == 1:
         st.caption(
             "Upload a second `.ld` log to overlay two drivers. Showing the "
             "selected lap for one driver."
         )
+        usable = available
+    else:
+        # Overlaying a whole field of ten traces is unreadable, so the drivers
+        # to compare are chosen explicitly — defaulting to the first two.
+        names = {i: s["driver"] for i, s in available}
+        picked = st.multiselect(
+            "Drivers to overlay", options=[i for i, _s in available],
+            default=[i for i, _s in available][:2],
+            format_func=lambda i: names[i], key="overlay_pick",
+            help="Two or three traces per chart stay readable; more gets busy.",
+        )
+        usable = [(i, s) for i, s in available if i in set(picked)]
+        if not usable:
+            st.info("Pick at least one driver to overlay.")
 
-    sel_cols = st.columns(len(usable))
+    sel_cols = st.columns(len(usable)) if usable else []
     traces = []
     for col, (i, s) in zip(sel_cols, usable):
         laps = s["laps"]
@@ -507,26 +768,29 @@ else:
             "name": s["driver"],
             "lap": int(chosen),
             "data": s["df"].iloc[lo:hi + 1],
+            "slot": i,
         })
 
-    x_col = ("Lap Distance [m]" if all("Lap Distance [m]" in t["data"].columns
-                                       for t in traces) else "Time [s]")
-    st.plotly_chart(
-        overlay_chart(traces, mode=MODE, x_col=x_col),
-        width="stretch",
-        config={"displaylogo": False},
-    )
-    if x_col == "Lap Distance [m]":
-        st.caption(
-            "X-axis is distance into the lap, so both drivers line up corner for "
-            "corner. Hover to read all three channels at one point on the track."
+    if traces:
+        x_col = ("Lap Distance [m]" if all("Lap Distance [m]" in t["data"].columns
+                                           for t in traces) else "Time [s]")
+        st.plotly_chart(
+            overlay_chart(traces, mode=MODE, x_col=x_col),
+            width="stretch",
+            config={"displaylogo": False},
         )
-    else:
-        st.caption(
-            ":warning: No `Distance` channel was found, so the overlay falls back "
-            "to elapsed time — the two traces are **not** aligned by track "
-            "position."
-        )
+        if x_col == "Lap Distance [m]":
+            st.caption(
+                "X-axis is distance into the lap, so the drivers line up corner "
+                "for corner. Hover to read every channel at one point on the "
+                "track — the power row shows which corner exit cost the energy."
+            )
+        else:
+            st.caption(
+                ":warning: No `Distance` channel was found, so the overlay falls "
+                "back to elapsed time — the traces are **not** aligned by track "
+                "position."
+            )
 
 # --------------------------------------------------------------------------
 # Diagnostics
