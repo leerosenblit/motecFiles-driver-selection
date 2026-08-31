@@ -2,7 +2,7 @@
 
 Compares driver stints from MoTeC telemetry to decide who drives the endurance
 race at Circuit Zolder. Upload **1 to 10** `.ld` logs — one gives a single-driver
-report, two a head-to-head, three or more a scored leaderboard.
+report; two or more brings up a scored leaderboard alongside the head-to-head.
 
 ```bash
 pip install -r requirements.txt
@@ -136,7 +136,8 @@ only as a fallback** — never both, since that would weight efficiency twice.
 
 ## Driver Score and the leaderboard
 
-From three drivers up, a leaderboard ranks the field on a single 0–100 score.
+From two drivers up, a leaderboard ranks the field on a single 0–100 score —
+a head-to-head is a leaderboard of two.
 Each metric is mapped onto points against a fixed reference — the value worth
 exactly half marks — then combined with the sidebar weights (default: pace 35%,
 energy 30%, consistency 35%, smoothness 10% — deliberately weighted toward

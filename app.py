@@ -121,20 +121,34 @@ MODE = active_theme()
 # --------------------------------------------------------------------------
 
 @st.cache_data(show_spinner=False)
-def load_stint(ld_bytes: bytes, ldx_bytes: bytes | None,
+def load_stint(ld_file_id: str, ldx_file_id: str | None,
+               _ld_bytes: bytes, _ldx_bytes: bytes | None,
                max_hz: float, lap_source: str) -> dict:
     """Parse one driver's log into everything the dashboard needs.
 
     Returns a plain dict so the result pickles cleanly into Streamlit's cache.
+
+    The cache key is built from `ld_file_id`/`ldx_file_id` — Streamlit's own
+    per-upload identifiers, a few bytes each — NOT from the actual file bytes.
+    An underscore-prefixed parameter is Streamlit's documented signal to skip
+    hashing that argument for the cache key, and `_ld_bytes` badly needs it: a
+    30-45 MB log takes ~150-250 ms to hash, and without this, `st.cache_data`
+    would redo that hash on *every* rerun the script makes for *any* reason —
+    dragging an unrelated sidebar slider, ticking a checkbox, typing a driver
+    name — because Streamlit reruns the whole script top to bottom on every
+    widget interaction and must re-check the cache key each time. With two or
+    three real logs loaded that tax stacked into a very noticeable multi-second
+    stall on every click, unrelated to parsing (which is well under a second)
+    or to the actual one-time network upload.
     """
-    log = read_ld(ld_bytes)
+    log = read_ld(_ld_bytes)
     df, found = to_dataframe(log, max_hz=max_hz)
 
     markers: list[float] = []
     ldx_error = None
-    if ldx_bytes:
+    if _ldx_bytes:
         try:
-            markers = read_ldx_markers(ldx_bytes, log_duration_s=log.duration_s)
+            markers = read_ldx_markers(_ldx_bytes, log_duration_s=log.duration_s)
         except ValueError as exc:
             ldx_error = str(exc)
 
@@ -219,7 +233,7 @@ if source == "Demo data":
     n_demo = st.sidebar.number_input(
         "Demo drivers", min_value=1, max_value=MAX_DRIVERS, value=2, step=1,
         key="n_demo",
-        help="Two gives the head-to-head; three or more brings up the leaderboard.",
+        help="Two or more brings up the leaderboard alongside the head-to-head.",
     )
 elif source == "Upload MoTeC logs":
     # Default 2 (the head-to-head case), openable up to a full squad of 10.
@@ -283,7 +297,7 @@ with st.sidebar.expander("Lap filtering", expanded=False):
 with st.sidebar.expander("Driver score weights", expanded=False):
     st.caption(
         "How much each metric counts toward the Driver Score on the leaderboard "
-        "(shown from three drivers up). Weights are renormalised, so only their "
+        "(shown from two drivers up). Weights are renormalised, so only their "
         "relative size matters."
     )
     w_pace = st.slider("Pace adherence", 0.0, 1.0,
@@ -332,6 +346,8 @@ else:
         try:
             with st.spinner(f"Parsing driver {slot}…"):
                 stint = load_stint(
+                    up["ld"].file_id,
+                    up["ldx"].file_id if up["ldx"] is not None else None,
                     up["ld"].getvalue(),
                     up["ldx"].getvalue() if up["ldx"] is not None else None,
                     float(max_hz), lap_pref,
@@ -367,7 +383,7 @@ if not stints:
 | **Energy** | Wh per lap, and Wh above what that pace should cost | This is a solar car: energy is the binding constraint |
 | **Acceleration** | Avg forward/deceleration and avg/max lateral G | Descriptive — how hard the car is driven, not scored good or bad |
 
-With three or more drivers, a **leaderboard** combines pace, consistency, energy
+With two or more drivers, a **leaderboard** combines pace, consistency, energy
 and smoothness into a single 0-100 Driver Score.
 
 Required channels: `LapTime`, `Throttle Pos [%]`, `Steering Angle [deg]`,
@@ -557,9 +573,10 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
 # Comparison table + ranking
 # --------------------------------------------------------------------------
 
-# From three drivers up, a single ordered leaderboard is the useful view — a
-# pairwise "who won" reading stops working once there is a field.
-if len(all_metrics) >= 3:
+# The leaderboard shows from two drivers up: a head-to-head is a leaderboard of
+# two, and showing the same Driver Score there — not just once a field exists —
+# means the number is already familiar by the time a third driver joins.
+if len(all_metrics) >= 2:
     st.subheader("Leaderboard")
 
     board = leaderboard(all_metrics, weights=score_weights)
