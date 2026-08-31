@@ -304,9 +304,13 @@ OVERLAY_ROWS = [
 
 def overlay_chart(traces: list[dict], mode: str = "light",
                   x_col: str = "Lap Distance [m]") -> go.Figure:
-    """Overlay one selected lap per driver against distance into the lap.
+    """Overlay each driver's per-channel data against distance into the lap.
 
-    `traces` is a list of dicts: {"name", "lap", "data" (per-lap DataFrame)}.
+    `traces` is a list of dicts: {"name", "label", "data", "slot"}. `data` is
+    typically an average across a driver's valid laps (built by
+    `motec_parser.average_lap_trace`) rather than one raw lap, so `label` is a
+    short free-text description of what `data` represents — e.g. "avg of 12
+    laps" — shown next to the driver's name in the legend and hover text.
 
     Distance into the lap — not elapsed time — is the x-axis, because that is
     what makes the comparison physical: at 1,200 m both drivers are at the same
@@ -334,7 +338,7 @@ def overlay_chart(traces: list[dict], mode: str = "light",
             data = t["data"]
             if col not in data.columns or x_col not in data.columns:
                 continue
-            label = f"{t['name']} — lap {t['lap']}"
+            label = f"{t['name']} — {t.get('label', 'average')}"
             # Same rule as the other charts: the colour belongs to the driver,
             # so picking a subset to overlay never repaints them.
             color, dash, _symbol = series_style(t.get("slot", i), mode)

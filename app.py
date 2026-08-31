@@ -80,6 +80,7 @@ from motec_parser import (
     CHANNEL_LABELS,
     add_lap_columns,
     apply_ldx_laps,
+    average_lap_trace,
     build_lap_table,
     read_ld,
     read_ldx_markers,
@@ -87,6 +88,7 @@ from motec_parser import (
 )
 from plots import (
     MAX_DRIVERS,
+    OVERLAY_ROWS,
     energy_chart,
     lap_pace_chart,
     overlay_chart,
@@ -188,7 +190,7 @@ def load_demo(max_hz: float, n_drivers: int = 2) -> dict[str, dict]:
             "lap_source": lap_source,
             "channel_map": {k: (CHANNEL_LABELS[k], "", int(frame.attrs.get("sample_hz", 20)))
                             for k in ("speed", "throttle", "steering", "g_lat",
-                                      "distance", "lap_time", "lap_number")},
+                                      "g_lon", "distance", "lap_time", "lap_number")},
             "all_channels": [(c, "", int(frame.attrs.get("sample_hz", 20)), len(frame))
                              for c in frame.columns if c != "Time [s]"],
             "sample_hz": frame.attrs.get("sample_hz", 20),
@@ -363,9 +365,10 @@ if not stints:
 | **Consistency** | Standard deviation of lap times | A metronomic driver is a predictable energy budget |
 | **Smoothness** | Variance of d(Throttle)/dt, in (%/s)² | A proxy for efficiency where no energy channel exists |
 | **Energy** | Wh per lap, and Wh above what that pace should cost | This is a solar car: energy is the binding constraint |
+| **Acceleration** | Avg forward/deceleration and avg/max lateral G | Descriptive — how hard the car is driven, not scored good or bad |
 
-With three or more drivers, a **leaderboard** combines all four into a single
-0-100 Driver Score.
+With three or more drivers, a **leaderboard** combines pace, consistency, energy
+and smoothness into a single 0-100 Driver Score.
 
 Required channels: `LapTime`, `Throttle Pos [%]`, `Steering Angle [deg]`,
 `G Force Lat [G]`, `Corr Speed [km/h]`, `Distance [m]`.
@@ -509,6 +512,36 @@ for i, (s, m) in enumerate(zip(stints, all_metrics)):
               f"Efficiency {m.wh_per_km:.1f} Wh/km. Source: {m.energy_source}.")
         if np.isfinite(m.median_energy_wh)
         else "No power, voltage+current, or energy channel found in this log.",
+    )
+
+    # Acceleration: descriptive, not scored good/bad — delta_color="off" so a
+    # bigger number isn't implied to be either better or worse, unlike the row
+    # above where every delta has a direction that means something for the seat.
+    c6, c7, c8, c9 = st.columns(4)
+    c6.metric(
+        "Avg forward accel", f"{m.avg_accel_g:.2f} G" if np.isfinite(m.avg_accel_g) else "—",
+        delta=delta(m.avg_accel_g, baseline.avg_accel_g), delta_color="off",
+        help="Mean of the positive longitudinal-G samples (accelerating) over "
+             "the valid laps.",
+    )
+    c7.metric(
+        "Avg deceleration", f"{m.avg_decel_g:.2f} G" if np.isfinite(m.avg_decel_g) else "—",
+        delta=delta(m.avg_decel_g, baseline.avg_decel_g), delta_color="off",
+        help="Mean magnitude of the negative longitudinal-G samples (braking) "
+             "over the valid laps.",
+    )
+    c8.metric(
+        "Avg lateral accel", f"{m.avg_lat_g:.2f} G" if np.isfinite(m.avg_lat_g) else "—",
+        delta=delta(m.avg_lat_g, baseline.avg_lat_g), delta_color="off",
+        help="Mean of |lateral G| over the valid laps. Uses the absolute value "
+             "because a signed mean would cancel a left-hander against a "
+             "right-hander and read near zero regardless of cornering load.",
+    )
+    c9.metric(
+        "Max lateral accel", f"{m.max_lat_g:.2f} G" if np.isfinite(m.max_lat_g) else "—",
+        delta=delta(m.max_lat_g, baseline.max_lat_g), delta_color="off",
+        help="Peak |lateral G| reached during the valid laps — the hardest "
+             "corner taken, in either direction.",
     )
 
     if m.excluded_laps:
@@ -767,16 +800,19 @@ else:
 # --------------------------------------------------------------------------
 
 st.subheader("Telemetry overlay")
+st.caption(
+    "Each line is the average of the driver's valid laps, resampled onto a "
+    "common distance grid and averaged point by point — not one raw recorded "
+    "lap. A single lap can be a lucky (or unlucky) sample of a driver's "
+    "technique; the average across the stint is the more honest comparison."
+)
 
 available = [(i, s) for i, s in enumerate(stints) if len(s["laps"])]
 if not available:
     st.info("No laps available to overlay.")
 else:
     if len(available) == 1:
-        st.caption(
-            "Upload a second `.ld` log to overlay two drivers. Showing the "
-            "selected lap for one driver."
-        )
+        st.caption("Upload a second `.ld` log to overlay two drivers.")
         usable = available
     else:
         # Overlaying a whole field of ten traces is unreadable, so the drivers
@@ -792,62 +828,36 @@ else:
         if not usable:
             st.info("Pick at least one driver to overlay.")
 
-    sel_cols = st.columns(len(usable)) if usable else []
+    channel_cols = [CHANNEL_LABELS[key] for key, _title in OVERLAY_ROWS]
     traces = []
-    for col, (i, s) in zip(sel_cols, usable):
-        laps = s["laps"]
-        options = [int(v) for v in laps["Lap"].tolist()]
-        keep_i = keep_masks[i].to_numpy()
-        labels = {}
-        for idx in range(len(laps)):
-            lap_no = int(laps["Lap"].iat[idx])
-            suffix = "" if keep_i[idx] else "  (excluded)"
-            labels[lap_no] = (f"Lap {lap_no} — "
-                              f"{format_lap_time(laps['LapTime [s]'].iat[idx])}{suffix}")
+    for i, s in usable:
+        keep_i = keep_masks[i]
+        n_used = int(keep_i.sum()) if len(keep_i) and keep_i.any() else len(s["laps"])
+        label = f"avg of {n_used} lap{'s' if n_used != 1 else ''}"
 
-        # Default to the driver's quickest kept lap — their best representative
-        # effort, rather than lap 1 which is an out-lap.
-        kept = laps[keep_masks[i].to_numpy()] if keep_masks[i].any() else laps
-        best_lap = int(kept.loc[kept["LapTime [s]"].idxmin(), "Lap"])
-
-        with col:
-            driver_heading(s["driver"], i)
-            chosen = st.selectbox(
-                "Lap to overlay", options,
-                index=options.index(best_lap) if best_lap in options else 0,
-                format_func=lambda v: labels.get(int(v), f"Lap {int(v)}"),
-                key=f"lap_pick_{i}",
+        avg_df = average_lap_trace(s["df"], s["laps"], keep_i, channel_cols)
+        driver_heading(s["driver"], i, label)
+        if avg_df.empty or len(avg_df) < 2:
+            st.caption(
+                ":warning: Could not build an averaged trace for this driver — "
+                "no `Distance` channel, or no lap has usable distance data."
             )
-
-        row = laps[laps["Lap"] == chosen].iloc[0]
-        lo, hi = int(row.start_idx), int(row.end_idx)
-        traces.append({
-            "name": s["driver"],
-            "lap": int(chosen),
-            "data": s["df"].iloc[lo:hi + 1],
-            "slot": i,
-        })
+            continue
+        traces.append({"name": s["driver"], "label": label, "data": avg_df, "slot": i})
 
     if traces:
-        x_col = ("Lap Distance [m]" if all("Lap Distance [m]" in t["data"].columns
-                                           for t in traces) else "Time [s]")
         st.plotly_chart(
-            overlay_chart(traces, mode=MODE, x_col=x_col),
+            overlay_chart(traces, mode=MODE, x_col="Lap Distance [m]"),
             width="stretch",
             config={"displaylogo": False},
         )
-        if x_col == "Lap Distance [m]":
-            st.caption(
-                "X-axis is distance into the lap, so the drivers line up corner "
-                "for corner. Hover to read every channel at one point on the "
-                "track — the power row shows which corner exit cost the energy."
-            )
-        else:
-            st.caption(
-                ":warning: No `Distance` channel was found, so the overlay falls "
-                "back to elapsed time — the traces are **not** aligned by track "
-                "position."
-            )
+        st.caption(
+            "X-axis is distance into the lap, so the drivers line up corner for "
+            "corner. Hover to read every channel at one point on the track — "
+            "the power row shows which corner exit cost the energy. The grid "
+            "only extends to each driver's shortest kept lap, so no line is "
+            "extrapolated past real data."
+        )
 
 # --------------------------------------------------------------------------
 # Diagnostics

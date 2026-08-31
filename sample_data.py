@@ -109,7 +109,7 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
     traffic_laps = traffic_laps or {}
 
     t_parts, speed_parts, thr_parts = [], [], []
-    steer_parts, glat_parts, dist_parts = [], [], []
+    steer_parts, glat_parts, glon_parts, dist_parts = [], [], [], []
     lapno_parts, laptime_parts = [], []
     power_parts, volt_parts, curr_parts, soc_parts = [], [], [], []
 
@@ -156,6 +156,11 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         # own pedal oscillation. `pump_amplitude` is what the smoothness metric
         # is designed to catch.
         accel = np.gradient(speed, t_lap)
+        # This is already the car's longitudinal acceleration (m/s^2, +forward
+        # / -braking) — the same signal drives the throttle demand below, so
+        # G Force Lon is just that quantity re-expressed in G rather than a
+        # separately modelled channel.
+        glon = accel / G
         base = 55.0 + 40.0 * np.tanh(accel / 0.6)
         # A fixed 0.3% sensor noise floor. Deliberately independent of the
         # driver knobs: sensor noise is a property of the car, not the driver.
@@ -197,6 +202,7 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         thr_parts.append(thr)
         steer_parts.append(steer)
         glat_parts.append(glat)
+        glon_parts.append(glon)
         dist_parts.append(dist)
         lapno_parts.append(np.full(n, lap, dtype=float))
         laptime_parts.append(t_lap)               # running timer, resets at the line
@@ -217,6 +223,7 @@ def synth_stint(name: str, n_laps: int = 14, freq: float = 20.0,
         "Throttle Pos [%]": np.concatenate(thr_parts),
         "Steering Angle [deg]": np.concatenate(steer_parts),
         "G Force Lat [G]": np.concatenate(glat_parts),
+        "G Force Lon [G]": np.concatenate(glon_parts),
         "Distance [m]": np.concatenate(dist_parts),
         "LapTime [s]": np.concatenate(laptime_parts),
         "Lap Number": np.concatenate(lapno_parts),
@@ -284,6 +291,7 @@ _SAMPLE_CHANNELS = [
     ("Throttle Pos [%]", "Throttle Pos", "Thr", "%", 25),
     ("Steering Angle [deg]", "Steering Angle", "Steer", "deg", 10),
     ("G Force Lat [G]", "G Force Lat", "GLat", "G", 10),
+    ("G Force Lon [G]", "G Force Lon", "GLon", "G", 10),
     ("Distance [m]", "Distance", "Dist", "m", 5),
     ("LapTime [s]", "Lap Time", "LapT", "s", 5),
     ("Lap Number", "Lap Number", "LapNo", "", 5),

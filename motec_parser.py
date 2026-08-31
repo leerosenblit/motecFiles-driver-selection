@@ -396,6 +396,12 @@ CHANNEL_ALIASES: dict[str, list[str]] = {
         "cg accel lateral", "accel lateral", "lateral acceleration",
         "lat accel", "acc lat",
     ],
+    "g_lon": [
+        "g force lon", "g force longitudinal", "longitudinal g", "long g",
+        "g lon", "acceleration longitudinal", "accel lon",
+        "cg accel longitudinal", "accel longitudinal", "longitudinal acceleration",
+        "long accel", "acc lon",
+    ],
     "distance": [
         "distance", "corr distance", "corrected distance", "lap distance",
         "dist", "odometer",
@@ -454,6 +460,7 @@ CHANNEL_UNIT_HINTS: dict[str, set[str]] = {
     "throttle": {"", "pct", "percent"},
     "steering": {"deg", "degrees", "rad"},
     "g_lat": {"g", "ms2", "mss"},
+    "g_lon": {"g", "ms2", "mss"},
     "distance": {"m", "km", "mi", "mile", "miles", "ft", "feet"},
     "power": {"w", "kw", "watt", "watts", "hp", "ps", "bhp", "cv"},
     "voltage": {"v", "volt", "volts", "mv"},
@@ -478,6 +485,7 @@ CHANNEL_LABELS = {
     "throttle": "Throttle Pos [%]",
     "steering": "Steering Angle [deg]",
     "g_lat": "G Force Lat [G]",
+    "g_lon": "G Force Lon [G]",
     "distance": "Distance [m]",
     "lap_time": "LapTime [s]",
     "lap_number": "Lap Number",
@@ -616,6 +624,15 @@ def _convert_units(key: str, ch: Channel) -> np.ndarray:
         finite = vals[np.isfinite(vals)]
         if finite.size and np.nanmax(np.abs(finite)) <= 1.5:
             vals = vals * 100.0                     # 0-1 fraction -> %
+    elif key in ("g_lat", "g_lon"):
+        # CHANNEL_UNIT_HINTS accepts m/s^2 for these two (some loggers report
+        # raw acceleration rather than a G-normalised channel), but until now
+        # nothing actually converted it — a m/s^2 channel was silently matched
+        # and then left in m/s^2. That is now load-bearing: the acceleration
+        # metrics assume G units, so a un-converted m/s^2 channel would read as
+        # ~9.8x too large.
+        if unit in ("ms2", "mss"):
+            vals = vals / 9.80665                   # m/s^2 -> G
 
     return vals
 
@@ -983,3 +1000,66 @@ def add_lap_columns(df: pd.DataFrame, laps: pd.DataFrame) -> pd.DataFrame:
             out.iloc[lo:hi + 1, lap_dist_loc] = np.cumsum(step)
 
     return out
+
+
+def average_lap_trace(df: pd.DataFrame, laps: pd.DataFrame,
+                      keep_mask: pd.Series | None, channel_cols: list[str],
+                      n_points: int = 200) -> pd.DataFrame:
+    """Average several channels across a driver's laps onto one distance grid.
+
+    Used by the head-to-head overlay: rather than picking one representative
+    lap (which is one sample of the driver's technique, cherry-picked or not),
+    this resamples EVERY kept lap's channels onto a common `Lap Distance [m]`
+    grid and averages point by point. The result is "what this driver typically
+    does at each point on the track" — the mean, not a copy of any single lap.
+
+    The grid spans 0 to the SHORTEST kept lap's distance, not the longest or the
+    median. Every included lap must have real data at every grid point: sizing
+    the grid to a longer lap would force `np.interp` to extrapolate the shorter
+    ones past their last real sample (it holds the edge value flat), which would
+    quietly bias the average toward a fabricated flat tail instead of real
+    driving. Losing a few metres off the end of the longest lap is the honest
+    trade.
+
+    Needs `add_lap_columns` to have been run first (`Lap Distance [m]` present).
+    Falls back to all laps if the keep mask rejects everything, same convention
+    used everywhere else laps are filtered.
+    """
+    dist_col = "Lap Distance [m]"
+    empty = pd.DataFrame(columns=[dist_col, *channel_cols])
+
+    if laps is None or len(laps) == 0 or dist_col not in df.columns:
+        return empty
+
+    used = (laps[keep_mask.to_numpy()]
+            if keep_mask is not None and keep_mask.any() else laps)
+    spans = [(int(r.start_idx), int(r.end_idx)) for r in used.itertuples(index=False)]
+    if not spans:
+        return empty
+
+    lap_dist_all = df[dist_col].to_numpy(dtype=np.float64)
+    lap_maxes = [np.nanmax(lap_dist_all[lo:hi + 1]) for lo, hi in spans]
+    lap_maxes = [m for m in lap_maxes if np.isfinite(m) and m > 0]
+    if not lap_maxes:
+        return empty
+    grid_max = min(lap_maxes)
+    grid = np.linspace(0.0, grid_max, n_points)
+
+    out = {dist_col: grid}
+    for col in channel_cols:
+        if col not in df.columns:
+            continue
+        col_vals = df[col].to_numpy(dtype=np.float64)
+        stacked = []
+        for lo, hi in spans:
+            d, v = lap_dist_all[lo:hi + 1], col_vals[lo:hi + 1]
+            good = np.isfinite(d) & np.isfinite(v)
+            d, v = d[good], v[good]
+            if len(d) < 2:
+                continue
+            order = np.argsort(d, kind="stable")
+            stacked.append(np.interp(grid, d[order], v[order]))
+        if stacked:
+            out[col] = np.mean(np.vstack(stacked), axis=0)
+
+    return pd.DataFrame(out)

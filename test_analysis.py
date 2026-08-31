@@ -39,7 +39,7 @@ def test_header_round_trips(ld_path):
     assert log.driver == "Test Driver"
     assert log.venue == "Zolder"
     assert log.warnings == []
-    assert len(log.channels) == 10
+    assert len(log.channels) == 11
 
 
 def test_channel_values_and_rates_round_trip(ld_path, stint):
@@ -78,7 +78,7 @@ def test_resampling_puts_all_channels_on_one_grid(ld_path):
     log = P.read_ld(ld_path)
     df, found = P.to_dataframe(log, max_hz=25.0)
 
-    assert set(found) == {"speed", "throttle", "steering", "g_lat",
+    assert set(found) == {"speed", "throttle", "steering", "g_lat", "g_lon",
                           "distance", "lap_time", "lap_number",
                           "voltage", "current", "soc", "power"}
     assert df["Time [s]"].is_monotonic_increasing

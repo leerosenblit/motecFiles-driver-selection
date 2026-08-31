@@ -29,9 +29,10 @@ python sample_data.py 10     # -> a full ten-driver field
 | [sample_data.py](sample_data.py) | Synthetic stints + a `.ld`/`.ldx` writer |
 | [test_analysis.py](test_analysis.py) | Parser and pace metrics — 34 tests |
 | [test_energy.py](test_energy.py) | Energy, Driver Score, real-log naming, palette — 36 tests |
+| [test_acceleration.py](test_acceleration.py) | Acceleration metrics, weight swap, averaged overlay — 22 tests |
 
 ```bash
-python -m pytest test_analysis.py test_energy.py -q     # 70 tests
+python -m pytest test_analysis.py test_energy.py test_acceleration.py -q     # 92 tests
 ```
 
 Pipeline per log:
@@ -52,6 +53,7 @@ compute_driver_metrics                -> the five metrics
 | **Pace adherence** | Mean of \|lap − 210 s\|. Absolute, because both directions are failures: under target burns energy we don't have, over it loses distance |
 | **Consistency** | Sample standard deviation (ddof=1) of the valid lap times |
 | **Smoothness** | Variance of d(Throttle)/dt in (%/s)², plus a 0–100 presentation score |
+| **Acceleration** | Avg forward/deceleration and avg/max lateral G (see below) | Descriptive only — not part of the Driver Score |
 | **Energy** | Wh per lap, Wh/km, and **energy excess** — Wh above what that driver's own pace should cost |
 
 Energy budget defaults to **100 Wh/lap** at the 210 s target. Note `Pit_Dashboard/constants.py` still lists the `base_210s` strategy at 80 Wh — the two want reconciling. It is a sidebar input either way.
@@ -137,7 +139,8 @@ only as a fallback** — never both, since that would weight efficiency twice.
 From three drivers up, a leaderboard ranks the field on a single 0–100 score.
 Each metric is mapped onto points against a fixed reference — the value worth
 exactly half marks — then combined with the sidebar weights (default: pace 35%,
-energy 30%, consistency 25%, smoothness 10%):
+energy 30%, consistency 35%, smoothness 10% — deliberately weighted toward
+repeatability over nominal pace, see the callout below):
 
 ```
 points = 100 · ref / (ref + value)
@@ -150,6 +153,11 @@ can't run away above 100.
 References: 2.5 s pace adherence, 2.0 s consistency σ, 4.0 Wh/lap energy excess.
 These are engineering judgements — they are the numbers to argue with if the
 board ever looks wrong.
+
+**Consistency now outweighs pace adherence (35% vs 25%)** — swapped from an
+earlier 35/25 split in pace's favour. A driver who reliably repeats their pace
+is a more predictable energy budget over a whole stint than one who is
+nominally closer to target on average but erratic lap to lap.
 
 Three deliberate properties:
 
@@ -207,6 +215,25 @@ Round-trip tested: `sample_data.write_ld` writes the same layout the parser
 reads, which is what verifies the struct offsets, the unit conversion and the
 per-channel resampling without needing a confidential team log.
 
+## Acceleration metrics
+
+Four descriptive numbers computed from the longitudinal (`G Force Lon`) and
+lateral (`G Force Lat`) G-force channels, over the same kept-laps mask as
+every other metric:
+
+- **Avg forward accel / avg deceleration** — longitudinal G is signed
+  (accelerating vs. braking), so this is simply the mean of the positive
+  samples and the mean magnitude of the negative ones. No absolute value is
+  needed here; the sign itself carries the meaning.
+- **Avg / max lateral accel** — lateral G is signed too (left vs. right), but
+  a left-hairpin and a right-hairpin of equal severity cancel in a plain mean,
+  so both figures use `|lateral G|`. A signed average would read near zero
+  regardless of how hard either was taken and would carry no information.
+
+These are deliberately **not** folded into the Driver Score — a spirited
+driver posts bigger numbers here without that implying anything about the
+seat decision on its own.
+
 ## Charts
 
 **Eight** validated categorical hues, stepped per theme, checked against both
@@ -232,9 +259,18 @@ the scales align.
 The overlay's x-axis is **distance into the lap**, not elapsed time: at 1,200 m
 both drivers are at the same corner, so a gap between their speed traces is a
 difference in driving rather than an artefact of one starting the lap earlier.
-This needs a `Distance` channel; without one the chart falls back to elapsed time
-and says so. A **power** row is added when the log has it — that's the one that
-shows which corner exit actually cost the watt-hours.
+A **power** row is added when the log has it — that's the one that shows which
+corner exit actually cost the watt-hours.
+
+Each trace is the **average across the driver's valid laps**, not one raw
+recorded lap: every kept lap's channels are resampled onto a common distance
+grid and averaged point by point (`motec_parser.average_lap_trace`). A single
+lap can be a lucky or unlucky sample of a driver's technique; the average is
+the more honest comparison. The grid extends only to the **shortest** kept
+lap's distance, never the longest — sizing it to a longer lap would force the
+shorter ones to extrapolate past their last real sample, quietly biasing the
+average toward a fabricated flat tail. This needs a `Distance` channel; without
+one no average trace can be built for that driver.
 
 ## Synthetic data
 

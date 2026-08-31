@@ -78,6 +78,11 @@ class DriverMetrics:
     total_energy_wh: float = float("nan")      # across the whole stint
     energy_excess_wh: float = float("nan")     # Wh/lap above the pace-matched expectation
     energy_source: str | None = None           # how energy was obtained
+    # Acceleration — descriptive, not judged good/bad in either direction.
+    avg_accel_g: float = float("nan")          # mean of positive longitudinal G
+    avg_decel_g: float = float("nan")          # mean of |negative longitudinal G|
+    avg_lat_g: float = float("nan")            # mean of |lateral G|
+    max_lat_g: float = float("nan")            # max of |lateral G|
     excluded_laps: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -226,6 +231,80 @@ def throttle_derivative(df: pd.DataFrame, laps: pd.DataFrame | None = None,
         pieces.append(np.gradient(thr, t))
 
     return np.concatenate(pieces) if pieces else np.array([])
+
+
+def _lap_ranges(df: pd.DataFrame, laps: pd.DataFrame | None,
+                keep_mask: pd.Series | None) -> list[tuple[int, int]]:
+    """Row-index (start, end) spans to include, matching throttle_derivative's
+    convention: kept laps only when a lap table exists, else the whole log."""
+    if laps is not None and len(laps):
+        used = laps[keep_mask.to_numpy()] if keep_mask is not None else laps
+        return [(int(r.start_idx), int(r.end_idx)) for r in used.itertuples(index=False)]
+    return [(0, len(df) - 1)]
+
+
+def acceleration_stats(df: pd.DataFrame, laps: pd.DataFrame | None = None,
+                       keep_mask: pd.Series | None = None) -> dict[str, float]:
+    """Longitudinal and lateral G-force summary over the laps being scored.
+
+    Four numbers, all descriptive rather than "good/bad" — a spirited driver
+    posts bigger numbers here without that meaning anything about the seat
+    decision on its own:
+
+      avg forward accel   mean of the POSITIVE longitudinal-G samples
+      avg deceleration    mean of the |negative longitudinal-G samples|
+                          (reported positive, i.e. braking magnitude)
+      avg lateral accel   mean of |lateral G|
+      max lateral accel   max of |lateral G|
+
+    Longitudinal G is signed (accelerating vs. braking) and splitting on the
+    sign is exactly what "average forward acceleration" vs. "average
+    deceleration" asks for — no absolute value needed there, the sign itself
+    carries the meaning.
+
+    Lateral G is signed too (left vs. right), but a left-hairpin and a
+    right-hairpin of equal severity cancel in a plain mean, so a SIGNED average
+    would read close to zero for every driver regardless of how hard either was
+    taken and would carry no information. Both lateral figures therefore use
+    the absolute value — max because that was specified explicitly, average
+    because the signed version is not a physically meaningful quantity. This
+    is a deliberate reading of "average lateral acceleration", flagged here
+    since the spec did not repeat "absolute value" for that one the way it did
+    for the max.
+
+    No dead-band around zero is applied — every non-zero sample counts toward
+    one side or the other, same as throttle_derivative takes every sample as-is
+    without filtering sensor noise.
+    """
+    out = {"avg_accel_g": float("nan"), "avg_decel_g": float("nan"),
+          "avg_lat_g": float("nan"), "max_lat_g": float("nan")}
+
+    ranges = _lap_ranges(df, laps, keep_mask)
+
+    lon_col = CHANNEL_LABELS.get("g_lon")
+    if lon_col and lon_col in df:
+        lon = pd.to_numeric(df[lon_col], errors="coerce").to_numpy()
+        pieces = [lon[lo:hi + 1] for lo, hi in ranges]
+        vals = np.concatenate(pieces) if pieces else np.array([])
+        vals = vals[np.isfinite(vals)]
+        fwd = vals[vals > 0]
+        brk = vals[vals < 0]
+        if fwd.size:
+            out["avg_accel_g"] = float(np.mean(fwd))
+        if brk.size:
+            out["avg_decel_g"] = float(np.mean(np.abs(brk)))
+
+    lat_col = CHANNEL_LABELS.get("g_lat")
+    if lat_col and lat_col in df:
+        lat = pd.to_numeric(df[lat_col], errors="coerce").to_numpy()
+        pieces = [lat[lo:hi + 1] for lo, hi in ranges]
+        vals = np.concatenate(pieces) if pieces else np.array([])
+        vals = np.abs(vals[np.isfinite(vals)])
+        if vals.size:
+            out["avg_lat_g"] = float(np.mean(vals))
+            out["max_lat_g"] = float(np.max(vals))
+
+    return out
 
 
 def smoothness_from_rate(rate: np.ndarray) -> tuple[float, float, float]:
@@ -378,6 +457,9 @@ def compute_driver_metrics(name: str, df: pd.DataFrame, laps: pd.DataFrame,
         if np.isfinite(m.smoothness_var):
             m.notes.append("Smoothness was computed over the whole log instead "
                            "of per lap.")
+        accel = acceleration_stats(df, None, None)
+        m.avg_accel_g, m.avg_decel_g = accel["avg_accel_g"], accel["avg_decel_g"]
+        m.avg_lat_g, m.max_lat_g = accel["avg_lat_g"], accel["max_lat_g"]
         return m
 
     lt = pd.to_numeric(laps["LapTime [s]"], errors="coerce")
@@ -416,6 +498,17 @@ def compute_driver_metrics(name: str, df: pd.DataFrame, laps: pd.DataFrame,
     if not np.isfinite(m.smoothness_var):
         m.notes.append("No throttle channel was found, so smoothness could not "
                        "be scored.")
+
+    # --- Acceleration ------------------------------------------------------
+    accel = acceleration_stats(df, laps, keep if m.n_laps_used else None)
+    m.avg_accel_g, m.avg_decel_g = accel["avg_accel_g"], accel["avg_decel_g"]
+    m.avg_lat_g, m.max_lat_g = accel["avg_lat_g"], accel["max_lat_g"]
+    if not np.isfinite(m.avg_accel_g) and not np.isfinite(m.avg_decel_g):
+        m.notes.append("No longitudinal G channel was found, so acceleration "
+                       "and deceleration could not be measured.")
+    if not np.isfinite(m.avg_lat_g):
+        m.notes.append("No lateral G channel was found, so lateral "
+                       "acceleration could not be measured.")
 
     # --- Energy ----------------------------------------------------------
     lap_wh, m.energy_source = energy_per_lap(df, laps)
@@ -482,6 +575,10 @@ def metrics_table(metrics: list[DriverMetrics],
             "Energy [Wh/lap]": num(m.median_energy_wh, "{:.1f}"),
             "Energy excess [Wh/lap]": num(m.energy_excess_wh, "{:+.1f}"),
             "Efficiency [Wh/km]": num(m.wh_per_km, "{:.1f}"),
+            "Avg accel [G]": num(m.avg_accel_g),
+            "Avg decel [G]": num(m.avg_decel_g),
+            "Avg lateral G": num(m.avg_lat_g),
+            "Max lateral G": num(m.max_lat_g),
         })
     return pd.DataFrame(rows)
 
@@ -501,11 +598,15 @@ SCORE_REFERENCES = {
     "energy": 4.0,        # Wh/lap above the pace-matched expectation
 }
 
-# What each metric is worth. Pace and energy lead because they are what the race
-# is actually limited by; consistency is the enabler; smoothness is only a proxy.
+# What each metric is worth. Consistency and energy lead: a driver who reliably
+# repeats their pace is a predictable energy budget, which is what an endurance
+# stint is actually limited by; raw pace adherence and smoothness (a proxy) count
+# for less. (Swapped from an earlier pace=0.35/consistency=0.25 split — a
+# deliberate team call to weight repeatability above nominal closeness to
+# target, not a bug.)
 DEFAULT_SCORE_WEIGHTS = {
-    "pace": 0.35,
-    "consistency": 0.25,
+    "pace": 0.25,
+    "consistency": 0.35,
     "energy": 0.30,
     "smoothness": 0.10,
 }
