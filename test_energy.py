@@ -310,116 +310,133 @@ def test_ranking_uses_energy_when_available_and_the_proxy_otherwise():
 # Driver Score / leaderboard
 # --------------------------------------------------------------------------
 
-def _fake(name, pace, cons, excess, smooth_score=60.0, laps=10):
-    """A DriverMetrics with the four inputs set directly."""
+def _fake(name, cons, energy, accel=1.0, decel=1.0, lat=1.0, maxlat=1.0, laps=10):
+    """A DriverMetrics with the six scored inputs set directly."""
     m = M.DriverMetrics(name=name, n_laps_used=laps, n_laps_total=laps)
     m.median_lap_s = 210.0
-    m.pace_adherence_s = pace
     m.consistency_s = cons
-    m.energy_excess_wh = excess
-    m.median_energy_wh = 80.0 + (excess if np.isfinite(excess) else 0.0)
-    m.smoothness_score = smooth_score
-    m.smoothness_rms = 20.0
+    m.median_energy_wh = energy
+    m.avg_accel_g = accel
+    m.avg_decel_g = decel
+    m.avg_lat_g = lat
+    m.max_lat_g = maxlat
     return m
 
 
 def test_score_is_bounded_and_monotonic():
-    best = M.driver_score(_fake("a", 0.0, 0.0, 0.0, 100.0))[0]
-    worst = M.driver_score(_fake("b", 50.0, 50.0, 200.0, 0.0))[0]
-    assert 0.0 <= worst < best <= 100.0
+    a = _fake("a", 0.1, 40.0, 0.1, 0.1, 0.1, 0.1)
+    b = _fake("b", 5.0, 400.0, 5.0, 5.0, 5.0, 5.0)
+    scores = M.driver_score([a, b])
+    assert 0.0 <= scores["b"][0] < scores["a"][0] <= 100.0
 
-    # Monotonic in each metric with the others held fixed.
-    for key, values in (("pace", (0.5, 1.5, 3.0, 6.0)),
-                        ("cons", (0.5, 1.5, 3.0, 6.0)),
-                        ("energy", (0.0, 2.0, 6.0, 15.0))):
-        scores = []
+    # Monotonic in each metric with the others held fixed and a frozen peer.
+    peer = _fake("peer", 2.0, 100.0, 2.0, 2.0, 2.0, 2.0)
+    for key, values in (("cons", (0.5, 1.0, 2.0, 4.0)),
+                        ("energy", (50.0, 75.0, 100.0, 150.0)),
+                        ("accel", (0.5, 1.0, 2.0, 4.0)),
+                        ("decel", (0.5, 1.0, 2.0, 4.0)),
+                        ("lat", (0.5, 1.0, 2.0, 4.0)),
+                        ("maxlat", (0.5, 1.0, 2.0, 4.0))):
+        pts = []
         for v in values:
-            args = {"pace": 1.5, "cons": 1.5, "energy": 2.0}
+            args = {"cons": 0.5, "energy": 50.0, "accel": 0.5,
+                    "decel": 0.5, "lat": 0.5, "maxlat": 0.5}
             args[key] = v
-            scores.append(M.driver_score(
-                _fake("x", args["pace"], args["cons"], args["energy"]))[0])
-        assert scores == sorted(scores, reverse=True), key
+            x = _fake("x", args["cons"], args["energy"], args["accel"],
+                      args["decel"], args["lat"], args["maxlat"])
+            pts.append(M.driver_score([x, peer])["x"][0])
+        assert pts == sorted(pts, reverse=True), key
 
 
-def test_score_reference_gives_half_marks():
-    parts = M.score_components(
-        _fake("x", M.SCORE_REFERENCES["pace"], M.SCORE_REFERENCES["consistency"],
-              M.SCORE_REFERENCES["energy"])
-    )
-    for key in ("pace", "consistency", "energy"):
+def test_double_the_best_value_scores_half_marks():
+    """points = 100 * best / value, so twice the best value is worth 50."""
+    best = _fake("best", 1.0, 50.0, 1.0, 1.0, 1.0, 1.0)
+    double = _fake("double", 2.0, 100.0, 2.0, 2.0, 2.0, 2.0)
+    parts = M.score_components([best, double])["double"]
+    for key in ("consistency", "energy", "avg_accel", "avg_decel",
+               "avg_lat_g", "max_lat_g"):
         assert parts[key] == pytest.approx(50.0)
 
 
 def test_one_bad_metric_cannot_wipe_out_the_score():
     """The bounded mapping never goes negative, so nothing gets cancelled."""
-    m = _fake("x", 0.3, 0.3, 500.0, 95.0)      # excellent except catastrophic energy
-    score, parts = M.driver_score(m)
-    assert parts["energy"] < 5.0
+    peer = _fake("peer", 1.0, 50.0, 1.0, 1.0, 1.0, 1.0)
+    # excellent on five metrics, catastrophic on max lateral G
+    m = _fake("x", 0.5, 25.0, 0.5, 0.5, 0.5, 500.0)
+    score, parts = M.driver_score([peer, m])["x"]
+    assert parts["max_lat_g"] < 1.0
     assert score > 50.0                        # the good metrics still count
 
 
-def test_beating_the_energy_expectation_takes_full_marks():
-    """Negative excess is clamped, not rewarded without limit."""
-    assert M.score_components(_fake("x", 1.0, 1.0, -25.0))["energy"] == pytest.approx(100.0)
+def test_zero_metric_value_scores_full_marks():
+    """A value of zero (e.g. a hypothetical zero-std-dev driver) can't be
+    divided into, so it is treated as already best-possible."""
+    zero = _fake("zero", 0.0, 50.0)
+    other = _fake("other", 1.0, 50.0)
+    assert M.score_components([zero, other])["zero"]["consistency"] == pytest.approx(100.0)
 
 
-def test_score_does_not_depend_on_the_peer_group():
-    """Adding a driver must not change anyone else's score."""
-    a = _fake("a", 1.0, 1.0, 1.0)
-    pair = M.leaderboard([a, _fake("b", 3.0, 3.0, 6.0)])
-    field = M.leaderboard([a, _fake("b", 3.0, 3.0, 6.0),
-                           _fake("c", 0.2, 0.2, 0.0),
-                           _fake("d", 9.0, 9.0, 30.0)])
-    assert (pair.loc[pair["Driver"] == "a", "Driver score"].iloc[0]
-            == pytest.approx(field.loc[field["Driver"] == "a", "Driver score"].iloc[0]))
+def test_score_is_peer_relative_and_can_shift_when_the_field_changes():
+    """Unlike an absolute-reference score, adding a driver CAN change everyone
+    else's score: each metric is graded against whoever is best among the
+    drivers being compared."""
+    a = _fake("a", 1.0, 80.0)
+    pair = M.leaderboard([a, _fake("b", 3.0, 120.0)])
+    field = M.leaderboard([a, _fake("b", 3.0, 120.0),
+                           _fake("c", 0.2, 40.0),
+                           _fake("d", 9.0, 300.0)])
+    a_pair = pair.loc[pair["Driver"] == "a", "Driver score"].iloc[0]
+    a_field = field.loc[field["Driver"] == "a", "Driver score"].iloc[0]
+    assert a_pair != pytest.approx(a_field)
 
 
 def test_leaderboard_is_sorted_best_first_and_positioned():
     board = M.leaderboard([
-        _fake("mid", 2.0, 2.0, 4.0),
-        _fake("best", 0.3, 0.4, 0.2),
-        _fake("worst", 6.0, 5.0, 14.0),
+        _fake("mid", 2.0, 120.0),
+        _fake("best", 0.3, 40.0),
+        _fake("worst", 6.0, 300.0),
     ])
     assert board["Driver"].tolist() == ["best", "mid", "worst"]
     assert board["Pos"].tolist() == [1, 2, 3]
     assert board["Driver score"].is_monotonic_decreasing
 
 
-def test_smoothness_inherits_the_energy_weight_when_energy_is_missing():
-    """A log with no energy data must not be scored as if energy were zero."""
-    high = _fake("x", 1.5, 1.5, float("nan"), smooth_score=90.0)
-    low = _fake("y", 1.5, 1.5, float("nan"), smooth_score=10.0)
-    score, parts = M.driver_score(high)
+def test_missing_metric_is_dropped_not_zeroed():
+    """A log with no energy channel must not be scored as if energy were
+    zero — the weight is dropped and the rest renormalised."""
+    a = _fake("a", 1.0, float("nan"))
+    b = _fake("b", 3.0, float("nan"))
+    score_a, parts_a = M.driver_score([a, b])["a"]
 
-    assert not np.isfinite(parts["energy"])
-    assert np.isfinite(score)
-    # Smoothness now carries 0.10 + 0.30 of the weight, so the gap between a 90
-    # and a 10 must exceed what a bare 10% weight could produce.
-    assert score - M.driver_score(low)[0] > 20.0
+    assert not np.isfinite(parts_a["energy"])
+    assert np.isfinite(score_a)
+    assert parts_a["consistency"] == pytest.approx(100.0)
 
 
 def test_score_survives_a_driver_with_no_metrics_at_all():
     blank = M.DriverMetrics(name="blank", n_laps_used=3, n_laps_total=3)
-    score, _parts = M.driver_score(blank)
+    score, _parts = M.driver_score([blank])["blank"]
     assert not np.isfinite(score)
 
 
 def test_leaderboard_skips_drivers_with_no_usable_laps():
-    board = M.leaderboard([_fake("ok", 1.0, 1.0, 1.0),
-                           _fake("empty", 1.0, 1.0, 1.0, laps=0)])
+    board = M.leaderboard([_fake("ok", 1.0, 80.0),
+                           _fake("empty", 1.0, 80.0, laps=0)])
     assert board["Driver"].tolist() == ["ok"]
 
 
 def test_custom_weights_change_the_order():
-    """Pace-first and energy-first weightings should disagree about these two."""
-    quick_thirsty = _fake("quick", 0.4, 1.2, 12.0)
-    steady_frugal = _fake("frugal", 2.6, 1.2, 0.2)
+    """Consistency-first and energy-first weightings should disagree about
+    these two drivers."""
+    quick_thirsty = _fake("quick", cons=0.4, energy=200.0)
+    steady_frugal = _fake("frugal", cons=2.6, energy=20.0)
+    zero = {"avg_accel": 0.0, "avg_decel": 0.0, "avg_lat_g": 0.0, "max_lat_g": 0.0}
 
-    pace_first = {"pace": 0.9, "consistency": 0.05, "energy": 0.05, "smoothness": 0.0}
-    energy_first = {"pace": 0.05, "consistency": 0.05, "energy": 0.9, "smoothness": 0.0}
+    consistency_first = {"consistency": 0.9, "energy": 0.05, **zero}
+    energy_first = {"consistency": 0.05, "energy": 0.9, **zero}
 
     assert M.leaderboard([quick_thirsty, steady_frugal],
-                         pace_first).iloc[0]["Driver"] == "quick"
+                         consistency_first).iloc[0]["Driver"] == "quick"
     assert M.leaderboard([quick_thirsty, steady_frugal],
                          energy_first).iloc[0]["Driver"] == "frugal"
 

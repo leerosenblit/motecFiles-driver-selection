@@ -587,135 +587,142 @@ def metrics_table(metrics: list[DriverMetrics],
 # Driver Score — one number per driver, for a leaderboard
 # --------------------------------------------------------------------------
 
-# Half-credit references. Each is the value at which that metric scores 50/100:
-# a driver exactly this far off gets half marks, better scores higher, worse
-# lower. These are engineering judgements about what "good" looks like for a
-# solar endurance stint at Zolder, and they are the numbers to argue with if the
-# leaderboard ever looks wrong.
-SCORE_REFERENCES = {
-    "pace": 2.5,          # s of mean absolute deviation from target
-    "consistency": 2.0,   # s of lap-time standard deviation
-    "energy": 4.0,        # Wh/lap above the pace-matched expectation
-}
-
-# What each metric is worth. Consistency and energy lead: a driver who reliably
-# repeats their pace is a predictable energy budget, which is what an endurance
-# stint is actually limited by; raw pace adherence and smoothness (a proxy) count
-# for less. (Swapped from an earlier pace=0.35/consistency=0.25 split — a
-# deliberate team call to weight repeatability above nominal closeness to
-# target, not a bug.)
+# What each metric is worth. All six are "lower is better" and are scored
+# peer-relative — see score_components — so this is a straight percentage
+# split, not a set of absolute reference points to argue with.
 DEFAULT_SCORE_WEIGHTS = {
-    "pace": 0.25,
-    "consistency": 0.35,
-    "energy": 0.30,
-    "smoothness": 0.10,
+    "consistency": 0.20,
+    "energy": 0.20,
+    "avg_accel": 0.15,
+    "avg_decel": 0.15,
+    "avg_lat_g": 0.15,
+    "max_lat_g": 0.15,
+}
+
+# Which DriverMetrics field feeds each scored component. Every one of these is
+# "lower is better": a tighter lap-time spread, less energy per lap, gentler
+# acceleration/braking/cornering.
+SCORE_FIELDS = {
+    "consistency": "consistency_s",
+    "energy": "median_energy_wh",
+    "avg_accel": "avg_accel_g",
+    "avg_decel": "avg_decel_g",
+    "avg_lat_g": "avg_lat_g",
+    "max_lat_g": "max_lat_g",
 }
 
 
-def _diminishing(value: float, ref: float) -> float:
-    """Map a "lower is better" metric onto 0-100 points.
+def score_components(metrics: list[DriverMetrics]) -> dict[str, dict[str, float]]:
+    """Per-driver 0-100 sub-scores, normalised against the best in `metrics`.
 
-        points = 100 * ref / (ref + value)
+    Returns {driver name: {component: points}}.
 
-    Chosen over a linear scale because it is bounded, always monotonic, and has
-    diminishing returns in both directions: it never goes negative for a very
-    poor value (which would let one bad metric wipe out a whole score), and it
-    cannot run away above 100 for an implausibly good one. It equals 50 exactly
-    at `value == ref`, which is what makes the references above readable.
+    Every component is "lower is better", and within the group being compared,
+    whoever posts the lowest (best) value on a metric scores 100 on it; anyone
+    else scores
 
-    Values below zero are clamped to zero, so a driver who beats the expectation
-    (negative energy excess) simply takes full marks rather than over-scoring.
+        points = 100 * best / value
+
+    a straight percentage of the best. This is **peer-relative, not absolute**:
+    a driver's points on any one metric depend on who else is in `metrics`, and
+    adding or removing a driver can move everyone else's numbers. That is a
+    deliberate team choice — the question this leaderboard answers is "who is
+    the best of the drivers on file", not "how does this driver compare to a
+    fixed engineering target".
+
+    A value that is zero or negative is treated as already best-possible (100
+    points) rather than dividing by it; missing (non-finite) values or a
+    missing best score as NaN, which driver_score then drops rather than
+    penalising.
     """
-    if not np.isfinite(value):
-        return float("nan")
-    return 100.0 * ref / (ref + max(float(value), 0.0))
+    bests: dict[str, float] = {}
+    for key, field_name in SCORE_FIELDS.items():
+        values = [getattr(m, field_name) for m in metrics]
+        finite_positive = [v for v in values if np.isfinite(v) and v > 0]
+        bests[key] = min(finite_positive) if finite_positive else float("nan")
+
+    out: dict[str, dict[str, float]] = {}
+    for m in metrics:
+        parts = {}
+        for key, field_name in SCORE_FIELDS.items():
+            value = getattr(m, field_name)
+            best = bests[key]
+            if not np.isfinite(value):
+                parts[key] = float("nan")
+            elif value <= 0:
+                parts[key] = 100.0
+            elif not np.isfinite(best):
+                parts[key] = float("nan")
+            else:
+                parts[key] = min(100.0, 100.0 * best / value)
+        out[m.name] = parts
+    return out
 
 
-def score_components(m: DriverMetrics) -> dict[str, float]:
-    """The four 0-100 sub-scores behind a driver's overall score."""
-    return {
-        "pace": _diminishing(m.pace_adherence_s, SCORE_REFERENCES["pace"]),
-        "consistency": _diminishing(m.consistency_s, SCORE_REFERENCES["consistency"]),
-        "energy": _diminishing(m.energy_excess_wh, SCORE_REFERENCES["energy"]),
-        "smoothness": m.smoothness_score,
-    }
+def driver_score(metrics: list[DriverMetrics],
+                 weights: dict[str, float] | None = None) -> dict[str, tuple[float, dict]]:
+    """Combine the six metrics into a single 0-100 Driver Score per driver.
 
+    Returns {driver name: (score, per-component sub-scores)}.
 
-def driver_score(m: DriverMetrics,
-                 weights: dict[str, float] | None = None) -> tuple[float, dict]:
-    """Combine the four metrics into a single 0-100 Driver Score.
+    Peer-relative by design (see score_components): every metric is normalised
+    against the best driver in `metrics`, so this must be called with the whole
+    group being compared, not one driver in isolation.
 
-    Returns (score, per-component sub-scores).
-
-    Three decisions worth knowing about:
-
-      * **Absolute, not relative.** Each metric is scored against a fixed
-        reference rather than against the other drivers in the comparison. A
-        driver's score therefore does not change when someone else is added to
-        or removed from the upload list, and scores are comparable across
-        sessions. Peer-relative scoring (z-scores, min-max) would make the
-        leaderboard shift under you for reasons that have nothing to do with
-        driving.
-
-      * **Smoothness is deliberately the smallest weight**, and when energy data
-        is missing it inherits energy's weight instead. Smoothness exists to
-        estimate energy waste, so with real watt-hours available it is close to
-        redundant — and the synthetic sweep shows the two can disagree entirely
-        (fast pedal oscillation is filtered out by vehicle inertia and costs
-        almost nothing, while slow surging costs plenty and barely registers as
-        pedal activity).
-
-      * **Missing metrics are dropped, not zeroed.** The weights of whatever is
-        available are renormalised to sum to 1, so a log with no throttle
-        channel yields a slightly less informed score rather than a punished one.
+    Missing metrics are dropped, not zeroed: the weights of whichever
+    components are available (finite) for a given driver are renormalised to
+    sum to 1, so a log missing a channel yields a slightly less informed score
+    rather than a punished one.
     """
     weights = dict(weights or DEFAULT_SCORE_WEIGHTS)
-    parts = score_components(m)
+    all_parts = score_components(metrics)
 
-    # Without measured energy, the proxy carries the efficiency weight.
-    if not np.isfinite(parts["energy"]):
-        weights["smoothness"] = weights.get("smoothness", 0.0) + weights.get("energy", 0.0)
-        weights["energy"] = 0.0
-
-    total_w = sum(w for k, w in weights.items()
-                  if w > 0 and np.isfinite(parts.get(k, float("nan"))))
-    if total_w <= 0:
-        return float("nan"), parts
-
-    score = sum(weights[k] * parts[k] for k in weights
-                if weights[k] > 0 and np.isfinite(parts.get(k, float("nan"))))
-    # Clamp: every component is already within [0, 100] and the weights are
-    # renormalised, so this only absorbs floating-point drift at the ends — but
-    # the score is documented as 0-100 and should not print 100.00000000000001.
-    return float(min(100.0, max(0.0, score / total_w))), parts
+    out: dict[str, tuple[float, dict]] = {}
+    for m in metrics:
+        parts = all_parts[m.name]
+        total_w = sum(w for k, w in weights.items()
+                      if w > 0 and np.isfinite(parts.get(k, float("nan"))))
+        if total_w <= 0:
+            out[m.name] = (float("nan"), parts)
+            continue
+        score = sum(weights[k] * parts[k] for k in weights
+                    if weights[k] > 0 and np.isfinite(parts.get(k, float("nan"))))
+        # Clamp: every component is already within [0, 100] and the weights are
+        # renormalised, so this only absorbs floating-point drift at the ends —
+        # but the score is documented as 0-100 and should not print 100.00000000000001.
+        out[m.name] = (float(min(100.0, max(0.0, score / total_w))), parts)
+    return out
 
 
 def leaderboard(metrics: list[DriverMetrics],
                 weights: dict[str, float] | None = None) -> pd.DataFrame:
     """Drivers ordered by Driver Score, best first."""
+    usable = [m for m in metrics if m.n_laps_used > 0]
+    if not usable:
+        return pd.DataFrame()
+
+    scores = driver_score(usable, weights)
     rows = []
-    for m in metrics:
-        if m.n_laps_used == 0:
-            continue
-        score, parts = driver_score(m, weights)
+    for m in usable:
+        score, parts = scores[m.name]
         rows.append({
             "Driver": m.name,
             "Driver score": score,
-            "Pace pts": parts["pace"],
             "Consistency pts": parts["consistency"],
             "Energy pts": parts["energy"],
-            "Smoothness pts": parts["smoothness"],
+            "Avg accel pts": parts["avg_accel"],
+            "Avg decel pts": parts["avg_decel"],
+            "Avg lateral G pts": parts["avg_lat_g"],
+            "Max lateral G pts": parts["max_lat_g"],
             "Median lap": format_lap_time(m.median_lap_s),
-            "Pace adherence [s]": m.pace_adherence_s,
             "Consistency σ [s]": m.consistency_s,
             "Energy [Wh/lap]": m.median_energy_wh,
-            "Energy excess [Wh/lap]": m.energy_excess_wh,
-            "Throttle rate RMS [%/s]": m.smoothness_rms,
+            "Avg accel [G]": m.avg_accel_g,
+            "Avg decel [G]": m.avg_decel_g,
+            "Avg lateral G": m.avg_lat_g,
+            "Max lateral G": m.max_lat_g,
             "Laps used": f"{m.n_laps_used} / {m.n_laps_total}",
         })
-
-    if not rows:
-        return pd.DataFrame()
 
     out = pd.DataFrame(rows).sort_values(
         "Driver score", ascending=False, na_position="last"

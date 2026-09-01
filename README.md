@@ -53,7 +53,7 @@ compute_driver_metrics                -> the five metrics
 | **Pace adherence** | Mean of \|lap − 210 s\|. Absolute, because both directions are failures: under target burns energy we don't have, over it loses distance |
 | **Consistency** | Sample standard deviation (ddof=1) of the valid lap times |
 | **Smoothness** | Variance of d(Throttle)/dt in (%/s)², plus a 0–100 presentation score |
-| **Acceleration** | Avg forward/deceleration and avg/max lateral G (see below) | Descriptive only — not part of the Driver Score |
+| **Acceleration** | Avg forward/deceleration and avg/max lateral G (see below) |
 | **Energy** | Wh per lap, Wh/km, and **energy excess** — Wh above what that driver's own pace should cost |
 
 Energy budget defaults to **100 Wh/lap** at the 210 s target. Note `Pit_Dashboard/constants.py` still lists the `base_210s` strategy at 80 Wh — the two want reconciling. It is a sidebar input either way.
@@ -137,40 +137,42 @@ only as a fallback** — never both, since that would weight efficiency twice.
 ## Driver Score and the leaderboard
 
 From two drivers up, a leaderboard ranks the field on a single 0–100 score —
-a head-to-head is a leaderboard of two.
-Each metric is mapped onto points against a fixed reference — the value worth
-exactly half marks — then combined with the sidebar weights (default: pace 35%,
-energy 30%, consistency 35%, smoothness 10% — deliberately weighted toward
-repeatability over nominal pace, see the callout below):
+a head-to-head is a leaderboard of two. Six metrics feed it, all "lower is
+better," each normalised against whoever posts the **best (lowest)** value
+among the drivers on file, as a percentage of that best:
 
 ```
-points = 100 · ref / (ref + value)
+points = 100 · best / value
 ```
 
-Bounded, always monotonic, equal to 50 at the reference. It cannot go negative,
-so one catastrophic metric can't cancel out an otherwise strong driver, and it
-can't run away above 100.
+Default weights (sidebar-adjustable):
 
-References: 2.5 s pace adherence, 2.0 s consistency σ, 4.0 Wh/lap energy excess.
-These are engineering judgements — they are the numbers to argue with if the
-board ever looks wrong.
+| Metric | Weight |
+|---|---|
+| Consistency (σ) | 20% |
+| Energy per lap | 20% |
+| Avg acceleration | 15% |
+| Avg deceleration | 15% |
+| Avg lateral acceleration | 15% |
+| Max lateral acceleration | 15% |
 
-**Consistency now outweighs pace adherence (35% vs 25%)** — swapped from an
-earlier 35/25 split in pace's favour. A driver who reliably repeats their pace
-is a more predictable energy budget over a whole stint than one who is
-nominally closer to target on average but erratic lap to lap.
+Whoever is best on a metric scores 100 on it; everyone else scores
+proportionally less. Two deliberate properties:
 
-Three deliberate properties:
-
-- **Absolute, not peer-relative.** Adding or removing a driver never changes
-  anyone else's score, and scores compare across sessions. Z-score or min-max
-  normalisation would make the board shift for reasons unrelated to driving.
+- **Peer-relative, not absolute.** Unlike earlier versions of this score, a
+  driver's points depend on who else is in the comparison — adding or removing
+  a driver can move everyone else's score, because the bar they're measured
+  against just moved. The question this leaderboard answers is "who is the
+  best of the drivers on file," not "how far is this driver from a fixed
+  engineering target."
 - **Missing metrics are dropped, not zeroed** — the remaining weights are
-  renormalised, so an incomplete log gives a less informed score, not a punished
-  one. A log with no energy data hands energy's weight to smoothness.
-- **A second, independent method is shown alongside** (equal-weight rank-summing).
-  Agreement between two different methods is a useful check; disagreement is
-  itself informative.
+  renormalised, so an incomplete log gives a less informed score, not a
+  punished one.
+
+**A second, independent method is shown alongside** (equal-weight
+rank-summing over pace adherence, consistency and energy/smoothness).
+Agreement between the two methods is a useful check; disagreement is itself
+informative.
 
 **Lap filtering.** Outliers are rejected with a median-absolute-deviation test,
 not mean/σ: MAD is itself robust, so a single five-minute lap barely moves it,
@@ -231,9 +233,10 @@ every other metric:
   so both figures use `|lateral G|`. A signed average would read near zero
   regardless of how hard either was taken and would carry no information.
 
-These are deliberately **not** folded into the Driver Score — a spirited
-driver posts bigger numbers here without that implying anything about the
-seat decision on its own.
+All four feed the Driver Score (see below) at 15% weight each, scored "lower
+is better" against the best driver on file — this is a deliberate team call
+about what "good" driving looks like for an endurance stint, not a claim that
+a spirited driver is a worse one on every other metric.
 
 ## Charts
 

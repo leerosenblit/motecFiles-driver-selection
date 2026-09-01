@@ -153,57 +153,66 @@ def test_metrics_table_includes_acceleration_columns():
 
 
 # --------------------------------------------------------------------------
-# Driver Score weight swap
+# Driver Score: consistency/energy/acceleration weights, peer-relative
 # --------------------------------------------------------------------------
 
-def test_pace_and_consistency_weights_are_swapped():
-    assert M.DEFAULT_SCORE_WEIGHTS["pace"] == pytest.approx(0.25)
-    assert M.DEFAULT_SCORE_WEIGHTS["consistency"] == pytest.approx(0.35)
-    # Energy and smoothness untouched by the swap.
-    assert M.DEFAULT_SCORE_WEIGHTS["energy"] == pytest.approx(0.30)
-    assert M.DEFAULT_SCORE_WEIGHTS["smoothness"] == pytest.approx(0.10)
+def test_score_weights_match_the_current_split():
+    assert M.DEFAULT_SCORE_WEIGHTS["consistency"] == pytest.approx(0.20)
+    assert M.DEFAULT_SCORE_WEIGHTS["energy"] == pytest.approx(0.20)
+    assert M.DEFAULT_SCORE_WEIGHTS["avg_accel"] == pytest.approx(0.15)
+    assert M.DEFAULT_SCORE_WEIGHTS["avg_decel"] == pytest.approx(0.15)
+    assert M.DEFAULT_SCORE_WEIGHTS["avg_lat_g"] == pytest.approx(0.15)
+    assert M.DEFAULT_SCORE_WEIGHTS["max_lat_g"] == pytest.approx(0.15)
     assert sum(M.DEFAULT_SCORE_WEIGHTS.values()) == pytest.approx(1.0)
 
 
-def _fake(name, pace, cons, excess=1.0, smooth_score=60.0, laps=10):
+def _fake(name, cons, energy, accel=1.0, decel=1.0, lat=1.0, maxlat=1.0, laps=10):
     m = M.DriverMetrics(name=name, n_laps_used=laps, n_laps_total=laps)
     m.median_lap_s = 210.0
-    m.pace_adherence_s = pace
     m.consistency_s = cons
-    m.energy_excess_wh = excess
-    m.median_energy_wh = 80.0 + excess
-    m.smoothness_score = smooth_score
-    m.smoothness_rms = 20.0
+    m.median_energy_wh = energy
+    m.avg_accel_g = accel
+    m.avg_decel_g = decel
+    m.avg_lat_g = lat
+    m.max_lat_g = maxlat
     return m
 
 
-def test_weight_swap_changes_who_the_leaderboard_prefers():
-    """The swap is only meaningful if it can flip a decision. Construct a driver
-    who is markedly better on pace but worse on consistency than another (equal
-    on everything else), and confirm the DEFAULT weighting (consistency-heavy)
-    now favours the consistent one — the opposite of the pre-swap 0.35/0.25
-    split. The gap is made large and asymmetric on purpose: with only 10
-    percentage points moving between the two weights, a mild scenario (checked
-    by hand first) does not flip — near-saturating both diminishing-returns
-    curves is what makes a 10-point weight shift decisive rather than marginal.
-    """
-    sharp_but_erratic = _fake("sharp", pace=0.05, cons=20.0)
-    steady_but_off = _fake("steady", pace=20.0, cons=0.05)
+def test_best_driver_on_a_metric_scores_100_points_on_it():
+    """Peer-relative scoring: the lowest (best) value among the drivers being
+    compared is worth full marks, everyone else a percentage of it."""
+    best = _fake("best", cons=1.0, energy=80.0)
+    worse = _fake("worse", cons=2.0, energy=160.0)
+    scores = M.driver_score([best, worse])
 
-    board = M.leaderboard([sharp_but_erratic, steady_but_off])
+    assert scores["best"][1]["consistency"] == pytest.approx(100.0)
+    assert scores["best"][1]["energy"] == pytest.approx(100.0)
+    assert scores["worse"][1]["consistency"] == pytest.approx(50.0)
+    assert scores["worse"][1]["energy"] == pytest.approx(50.0)
+
+
+def test_weight_choice_can_flip_who_the_leaderboard_prefers():
+    """Construct a driver who is markedly better on consistency but worse on
+    energy than another (equal on everything else, so those two metrics
+    decide it), and confirm the weighting alone can flip the leaderboard."""
+    steady_thirsty = _fake("steady", cons=0.5, energy=200.0)
+    erratic_frugal = _fake("erratic", cons=20.0, energy=80.0)
+    zero = {"avg_accel": 0.0, "avg_decel": 0.0, "avg_lat_g": 0.0, "max_lat_g": 0.0}
+
+    consistency_heavy = {"consistency": 0.9, "energy": 0.1, **zero}
+    board = M.leaderboard([steady_thirsty, erratic_frugal], weights=consistency_heavy)
     assert board.iloc[0]["Driver"] == "steady"
 
-    pre_swap_weights = {"pace": 0.35, "consistency": 0.25,
-                        "energy": 0.30, "smoothness": 0.10}
-    board_pre_swap = M.leaderboard([sharp_but_erratic, steady_but_off],
-                                   weights=pre_swap_weights)
-    assert board_pre_swap.iloc[0]["Driver"] == "sharp"
+    energy_heavy = {"consistency": 0.1, "energy": 0.9, **zero}
+    board2 = M.leaderboard([steady_thirsty, erratic_frugal], weights=energy_heavy)
+    assert board2.iloc[0]["Driver"] == "erratic"
 
 
-def test_score_still_bounded_and_sums_to_one_after_swap():
-    score, parts = M.driver_score(_fake("x", 1.0, 1.0, 1.0))
+def test_score_still_bounded_and_all_six_components_present():
+    score, parts = M.driver_score([_fake("x", 1.0, 80.0)])["x"]
     assert 0.0 <= score <= 100.0
-    assert set(parts) == {"pace", "consistency", "energy", "smoothness"}
+    assert set(parts) == {"consistency", "energy", "avg_accel", "avg_decel",
+                          "avg_lat_g", "max_lat_g"}
 
 
 # --------------------------------------------------------------------------

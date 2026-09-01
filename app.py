@@ -63,7 +63,6 @@ if not _running_under_streamlit():
 from metrics import (
     DEFAULT_SCORE_WEIGHTS,
     ENERGY_BUDGET_WH_PER_LAP,
-    SCORE_REFERENCES,
     STRATEGY_REFERENCE,
     TARGET_LAP_TIME_S,
     compute_driver_metrics,
@@ -297,20 +296,26 @@ with st.sidebar.expander("Lap filtering", expanded=False):
 with st.sidebar.expander("Driver score weights", expanded=False):
     st.caption(
         "How much each metric counts toward the Driver Score on the leaderboard "
-        "(shown from two drivers up). Weights are renormalised, so only their "
-        "relative size matters."
+        "(shown from two drivers up). Each metric is scored against the best "
+        "(lowest) driver on file, as a percentage of that best. Weights are "
+        "renormalised, so only their relative size matters."
     )
-    w_pace = st.slider("Pace adherence", 0.0, 1.0,
-                       DEFAULT_SCORE_WEIGHTS["pace"], 0.05, key="w_pace")
     w_cons = st.slider("Consistency", 0.0, 1.0,
                        DEFAULT_SCORE_WEIGHTS["consistency"], 0.05, key="w_cons")
-    w_energy = st.slider("Energy", 0.0, 1.0,
+    w_energy = st.slider("Energy (per lap)", 0.0, 1.0,
                          DEFAULT_SCORE_WEIGHTS["energy"], 0.05, key="w_energy")
-    w_smooth = st.slider("Smoothness", 0.0, 1.0,
-                         DEFAULT_SCORE_WEIGHTS["smoothness"], 0.05, key="w_smooth")
+    w_accel = st.slider("Avg acceleration", 0.0, 1.0,
+                        DEFAULT_SCORE_WEIGHTS["avg_accel"], 0.05, key="w_accel")
+    w_decel = st.slider("Avg deceleration", 0.0, 1.0,
+                        DEFAULT_SCORE_WEIGHTS["avg_decel"], 0.05, key="w_decel")
+    w_lat = st.slider("Avg lateral acceleration", 0.0, 1.0,
+                      DEFAULT_SCORE_WEIGHTS["avg_lat_g"], 0.05, key="w_lat")
+    w_maxlat = st.slider("Max lateral acceleration", 0.0, 1.0,
+                         DEFAULT_SCORE_WEIGHTS["max_lat_g"], 0.05, key="w_maxlat")
 
-    raw_weights = {"pace": w_pace, "consistency": w_cons,
-                   "energy": w_energy, "smoothness": w_smooth}
+    raw_weights = {"consistency": w_cons, "energy": w_energy,
+                   "avg_accel": w_accel, "avg_decel": w_decel,
+                   "avg_lat_g": w_lat, "max_lat_g": w_maxlat}
     if sum(raw_weights.values()) <= 0:
         st.caption(":warning: All weights are zero — falling back to the defaults.")
         score_weights = dict(DEFAULT_SCORE_WEIGHTS)
@@ -383,8 +388,10 @@ if not stints:
 | **Energy** | Wh per lap, and Wh above what that pace should cost | This is a solar car: energy is the binding constraint |
 | **Acceleration** | Avg forward/deceleration and avg/max lateral G | Descriptive — how hard the car is driven, not scored good or bad |
 
-With two or more drivers, a **leaderboard** combines pace, consistency, energy
-and smoothness into a single 0-100 Driver Score.
+With two or more drivers, a **leaderboard** combines consistency, energy per
+lap, and average/max acceleration, deceleration and lateral G into a single
+0-100 Driver Score, each metric scored as a percentage of whoever posts the
+best (lowest) value.
 
 Required channels: `LapTime`, `Throttle Pos [%]`, `Steering Angle [deg]`,
 `G Force Lat [G]`, `Corr Speed [km/h]`, `Distance [m]`.
@@ -589,50 +596,48 @@ if len(all_metrics) >= 2:
                f"{board.iloc[1]['Driver score']:.1f}." if len(board) > 1 else ".")
         )
 
-        show = board[["Pos", "Driver", "Driver score", "Pace pts",
-                      "Consistency pts", "Energy pts", "Smoothness pts",
+        show = board[["Pos", "Driver", "Driver score", "Consistency pts",
+                      "Energy pts", "Avg accel pts", "Avg decel pts",
+                      "Avg lateral G pts", "Max lateral G pts",
                       "Median lap", "Laps used"]]
         st.dataframe(
             show, hide_index=True, width="stretch",
             column_config={
                 "Driver score": st.column_config.ProgressColumn(
                     "Driver score", min_value=0, max_value=100,
-                    format="%.1f", help="Weighted 0-100 composite of all four metrics.",
+                    format="%.1f", help="Weighted 0-100 composite of all six metrics.",
                 ),
                 **{c: st.column_config.NumberColumn(c, format="%.0f")
-                   for c in ("Pace pts", "Consistency pts", "Energy pts",
-                             "Smoothness pts")},
+                   for c in ("Consistency pts", "Energy pts", "Avg accel pts",
+                             "Avg decel pts", "Avg lateral G pts",
+                             "Max lateral G pts")},
             },
         )
 
         with st.expander("How the Driver Score is calculated"):
             st.markdown(
                 f"""
-Each metric is scored 0-100 against a fixed reference — the value worth exactly
-half marks — then combined with the weights in the sidebar:
+Each metric is "lower is better". Whoever posts the best (lowest) value among
+the drivers on file scores 100 on it; everyone else scores a straight
+percentage of that best:
 
-| Metric | Half-credit reference | Weight |
-|---|---|---|
-| Pace adherence | {SCORE_REFERENCES['pace']:.1f} s from target | {score_weights['pace']:.0%} |
-| Consistency (σ) | {SCORE_REFERENCES['consistency']:.1f} s | {score_weights['consistency']:.0%} |
-| Energy excess | {SCORE_REFERENCES['energy']:.1f} Wh/lap over pace-matched | {score_weights['energy']:.0%} |
-| Smoothness | throttle-rate variance | {score_weights['smoothness']:.0%} |
+`points = 100 x best / value`
 
-`points = 100 · ref / (ref + value)` — bounded, always monotonic, and equal to
-50 exactly at the reference. It can't go negative, so one bad metric can't wipe
-out an otherwise strong driver, and it can't run away above 100 either.
+Those points are then combined with the weights in the sidebar:
 
-**Scored against fixed references, not against each other.** Adding or removing
-a driver never changes anyone else's score, and scores are comparable between
-sessions. Peer-relative scoring would make the board shift for reasons that have
-nothing to do with driving.
+| Metric | Weight |
+|---|---|
+| Consistency (σ) | {score_weights['consistency']:.0%} |
+| Energy per lap | {score_weights['energy']:.0%} |
+| Avg acceleration | {score_weights['avg_accel']:.0%} |
+| Avg deceleration | {score_weights['avg_decel']:.0%} |
+| Avg lateral acceleration | {score_weights['avg_lat_g']:.0%} |
+| Max lateral acceleration | {score_weights['max_lat_g']:.0%} |
 
-**Smoothness carries the smallest weight on purpose.** It is a *proxy* for energy
-waste, so where real watt-hours exist it is nearly redundant — and the two can
-disagree outright: fast pedal oscillation is filtered out by the car's inertia
-and costs almost nothing, while slow surging costs plenty and barely shows up as
-pedal activity. When a log has no energy channels, smoothness inherits energy's
-weight instead.
+**Peer-relative, not absolute.** Every number above is scored against the best
+driver currently on file, not a fixed engineering target — adding or removing
+a driver can move everyone else's score, because the bar they're measured
+against just moved.
 
 Missing metrics are dropped and the remaining weights renormalised, so an
 incomplete log gives a less informed score rather than a punished one.
